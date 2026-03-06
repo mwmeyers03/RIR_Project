@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rir_project"
+version = "0.1.0"
+description = "Physics-informed RIR generation framework"
+authors = [{name = "User", email = ""}]
+readme = "ARCHITECTURE.md"
+license = {text = "MIT"}
+
+[project.dependencies]
+torch = "*"
+pandas = "*"
+numpy = "*"
+scipy = "*"
+# other dependencies installed at runtime may include datasets, huggingface_hub
