@@ -1,0 +1,38 @@
+# RIR Project — Cursor rules
+
+You are working in the **Physics-Informed RIR Generation Framework**. The project is notebook-driven with a single entry point: `RIR_Project.ipynb`. All executable code lives in that notebook; there are no required standalone Python modules.
+
+## Tech stack
+
+- **Python 3** with `from __future__ import annotations`
+- **PyTorch** for models, training, and tensors
+- **HuggingFace:** `datasets`, `huggingface_hub` for data (mandipgoswami/rirmega)
+- **Data/science:** pandas, numpy, scipy
+- **Environment:** Colab-friendly (in-notebook pip install, single `DEVICE` global)
+
+## Coding style
+
+- Use **type hints** on function signatures and return types (e.g. `Tuple[torch.Tensor, Dict[str, torch.Tensor]]`, `Optional[str]`).
+- Add **docstrings** for public functions and classes; use Parameters/Returns (or Args/Returns) where applicable.
+- **Constants** at module/cell scope: UPPER_SNAKE_CASE (e.g. `INPUT_DIM`, `OCTAVE_BANDS`, `DEFAULT_MAX_RIR_LEN`).
+- **Section headers** in code: `# ---- Section Name ----` or `# ========== ... ==========`.
+- Prefer **named constants** (`INPUT_DIM`, `METRICS_DIM`, `MODAL_FEAT_DIM`, `OCTAVE_BANDS`) over magic numbers when passing data between phases or defining shapes.
+
+## Data passing between modules
+
+- **Single sample (Dataset):** `__getitem__` returns `(x, y)` where
+  - `x`: `torch.Tensor` of shape `[INPUT_DIM]` (24)
+  - `y`: `Dict[str, torch.Tensor]` with keys `metrics`, `rir`, `edc`, `edc_mb`, `rir_length`; shapes `[METRICS_DIM]`, `[max_len]`, `[max_len]`, `[num_time_steps, num_bands]`, scalar.
+- **Batches:** Use the existing `rir_collate_fn`. Batches are `(x_batch [B, 24], y_batch: Dict[str, Tensor])` with the same keys and batch dimension first.
+- **Model I/O:** LSTM input `[B, INPUT_DIM]`, output `edc_pred` `[B, num_time_steps, num_bands]`. Loss and synthesis components expect these shapes; when adding features or outputs, keep `INPUT_DIM`, `METRICS_DIM`, `MODAL_FEAT_DIM`, and `OCTAVE_BANDS` consistent.
+- **Device:** Move tensors to `DEVICE` at the trainer/loader boundary; do not hardcode `"cuda"` or `"cpu"` in shared helpers.
+
+## Phase and module interaction
+
+- **Notebook phases** run in order 1 → 6. Unit tests may depend on previous phases (e.g. Phase 2 test uses Phase 1 dataset if loaded). Do not assume later-phase symbols exist when editing earlier cells.
+- If code is **extracted to `.py` modules**, preserve the same data contracts and constants (e.g. a shared `constants.py` or schema doc) so the notebook and any scripts stay aligned.
+
+## Conventions
+
+- **Cell comments:** Match existing style: `# Cell N — Short Title`, `# ============================================================`.
+- **New datasets or loaders** that feed the LSTM/loss/synthesis pipeline must conform to the same X/Y schema (same keys and shapes as above).
