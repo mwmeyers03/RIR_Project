@@ -269,12 +269,14 @@ def get_dataloader(
     sample_rate: int = 16_000,
     use_cache: bool = True,
     shuffle: bool = True,
+    cache_dir: Optional[str] = None,
 ) -> DataLoader:
     ds: Dataset = RIRMegaDataset(
         split=split,
         max_rir_len=max_rir_len,
         num_time_steps=num_time_steps,
         sample_rate=sample_rate,
+        cache_dir=cache_dir,
     )
     if use_cache:
         ds = CachedRIRDataset(ds)

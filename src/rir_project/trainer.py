@@ -27,6 +27,7 @@ class TrainingConfig:
     max_rir_len: int = 32_000
     sample_rate: int = 16_000
     use_cache: bool = True
+    hf_cache_dir: Optional[str] = None
 
     # model
     hidden_dim: int = 256
@@ -99,6 +100,7 @@ class RIRTrainer:
             sample_rate=c.sample_rate,
             use_cache=c.use_cache,
             shuffle=True,
+            cache_dir=c.hf_cache_dir,
         )
         self.val_loader = get_dataloader(
             split="val",
@@ -109,6 +111,7 @@ class RIRTrainer:
             sample_rate=c.sample_rate,
             use_cache=c.use_cache,
             shuffle=False,
+            cache_dir=c.hf_cache_dir,
         )
         self.lstm = MultibandEDCPredictor(
             input_dim=INPUT_DIM,
