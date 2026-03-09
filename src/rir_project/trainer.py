@@ -313,16 +313,34 @@ class RIRTrainer:
         self.criterion.lambda_cont = c.lambda_cont_target * alpha
         self.criterion.lambda_mom = c.lambda_mom_target * alpha
 
-    def _predict_rir_from_edc(self, edc_pred: torch.Tensor) -> torch.Tensor:
+    def _predict_rir_from_edc(
+        self,
+        edc_pred: torch.Tensor,
+        apply_unet: bool = True,
+    ) -> torch.Tensor:
+        """Return a time-domain RIR from a multiband EDC prediction.
+
+        The U‑Net refiner (if enabled) is applied **only** when
+        ``apply_unet`` is True and ``self.unet_refiner`` is not None.  The
+        flag simplifies loss computation in the training loop when we want
+        to compare both pre- and post‑refinement signals.
+        """
         edc_1d = edc_pred.mean(dim=2)
         if self.cfg.train_fdn and self.fdn is not None:
             late = self.fdn(edc_1d)
             if self.cfg.early_late_split and self.early is not None:
-                return late + self.early(edc_1d)
-            return late
-        # Use multiband phase reconstruction (fixes metallic artefacts from single broadband)
-        edc_mb_clamped = edc_pred.clamp(min=0.0)
-        return self.mb_phase_recon(edc_mb_clamped)
+                rir = late + self.early(edc_1d)
+            else:
+                rir = late
+        else:
+            # Use multiband phase reconstruction (fixes metallic artefacts from single broadband)
+            edc_mb_clamped = edc_pred.clamp(min=0.0)
+            rir = self.mb_phase_recon(edc_mb_clamped)
+
+        if apply_unet and self.unet_refiner is not None:
+            # forward through refiner; shape [B, L] -> [B,1,L] -> [B,L]
+            rir = self.unet_refiner(rir.unsqueeze(1)).squeeze(1)
+        return rir
 
     @staticmethod
     def _acoustic_metrics(pred: np.ndarray, ref: np.ndarray, sample_rate: int) -> Dict[str, float]:
@@ -366,11 +384,15 @@ class RIRTrainer:
                 loss = self.criterion(edc_pred, edc_target)
                 fdn_loss = torch.zeros((), device=self.device)
                 if self.cfg.train_fdn and self.fdn is not None:
-                    rir_pred = self._predict_rir_from_edc(edc_pred)
+                    # predict with optional U-Net applied
+                    rir_pred = self._predict_rir_from_edc(edc_pred, apply_unet=True)
                     rir_target = y["rir"].to(self.device)
                     L = min(rir_pred.shape[1], rir_target.shape[1])
                     fdn_loss = F.mse_loss(rir_pred[:, :L], rir_target[:, :L])
-                    loss = loss + self.cfg.fdn_weight * fdn_loss
+                    # unet_weight lets the user scale the contribution of the
+                    # time-domain loss when a refiner is present
+                    weight = self.cfg.unet_weight if self.unet_refiner is not None else 1.0
+                    loss = loss + self.cfg.fdn_weight * weight * fdn_loss
                     # MR-STFT loss applied to time-domain RIR when FDN is active
                     if self.mr_stft_loss is not None:
                         mr_loss = self.mr_stft_loss(rir_pred[:, :L].float(), rir_target[:, :L].float())
@@ -424,12 +446,14 @@ class RIRTrainer:
                 edc_pred = self.lstm(x)
                 loss = self.criterion(edc_pred, edc_target)
                 fdn_loss = torch.zeros((), device=self.device)
-                rir_pred = self._predict_rir_from_edc(edc_pred)
+                # validation predictions also go through the refiner if active
+                rir_pred = self._predict_rir_from_edc(edc_pred, apply_unet=True)
                 if self.cfg.train_fdn and self.fdn is not None:
                     rir_target = y["rir"].to(self.device)
                     L = min(rir_pred.shape[1], rir_target.shape[1])
                     fdn_loss = F.mse_loss(rir_pred[:, :L], rir_target[:, :L])
-                    loss = loss + self.cfg.fdn_weight * fdn_loss
+                    weight = self.cfg.unet_weight if self.unet_refiner is not None else 1.0
+                    loss = loss + self.cfg.fdn_weight * weight * fdn_loss
 
                 if batch_idx < max(1, self.cfg.metrics_eval_batches):
                     rir_ref = y["rir"].cpu().numpy()
