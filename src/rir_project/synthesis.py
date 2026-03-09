@@ -27,14 +27,19 @@ class ConditionedFDN(nn.Module):
 
 
 class EarlyReflections(nn.Module):
-    """Simple delayed-sum early reflection generator."""
+    """Simple delayed-sum early reflection generator (43 taps)."""
 
     def __init__(self, n_taps: int = 43):
         super().__init__()
+        self.n_taps = n_taps
         self.gains = nn.Parameter(torch.zeros(n_taps))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+        # x: [B, L]
+        B, L = x.shape
+        kernel = self.gains.flip(0).view(1, 1, self.n_taps)
+        out = F.conv1d(x.unsqueeze(1), kernel, padding=self.n_taps - 1)
+        return out.squeeze(1)[:, :L]
 
 
 class EDCToFDNMapper(nn.Module):
@@ -88,7 +93,7 @@ class EDCToFDNMapper(nn.Module):
 class SignStickyPhaseReconstructor(nn.Module):
     """Reconstructs time-domain waveform from EDC using random sign-sticky scheme."""
 
-    def __init__(self, stickiness: float = 0.9, seed: Optional[int] = None) -> None:
+    def __init__(self, stickiness: float = 0.90, seed: Optional[int] = None) -> None:
         super().__init__()
         assert 0.0 <= stickiness <= 1.0
         self.stickiness = stickiness

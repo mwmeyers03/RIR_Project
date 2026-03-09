@@ -41,11 +41,13 @@ def _field_type_for_arg(field_type: Any):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the Physics-Informed RIR model")
-+    parser.add_argument("--hf-cache-dir", dest="hf_cache_dir", type=str, default=None,
-+                        help="local HuggingFace datasets cache directory (e.g. drive mount)")
+    parser.add_argument("--hf-cache-dir", dest="hf_cache_dir", type=str, default=None,
+                        help="local HuggingFace datasets cache directory (e.g. drive mount)")
 
     for f in fields(TrainingConfig):
         arg_name = f"--{f.name.replace('_', '-')}"
+        if arg_name == "--hf-cache-dir":
+            continue  # already added above
         arg_type = _field_type_for_arg(f.type)
         parser.add_argument(
             arg_name,
@@ -69,9 +71,9 @@ def main() -> dict[str, list]:
     parser = build_parser()
     args = parser.parse_args()
     cfg_dict = vars(args)
-+    # normalize empty string -> None
-+    if cfg_dict.get("hf_cache_dir") == "":
-+        cfg_dict["hf_cache_dir"] = None
+    # normalize empty string -> None
+    if cfg_dict.get("hf_cache_dir") == "":
+        cfg_dict["hf_cache_dir"] = None
     _coerce_optional_seed(cfg_dict)
 
     cfg = TrainingConfig(**cfg_dict)

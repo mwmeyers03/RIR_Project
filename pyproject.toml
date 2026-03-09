@@ -6,13 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "rir_project"
 version = "0.1.0"
 description = "Physics-informed RIR generation framework"
-authors = [{name = "User", email = ""}]
+authors = [{name = "User"}]
 readme = "ARCHITECTURE.md"
 license = {text = "MIT"}
-
-[project.dependencies]
-torch = "*"
-pandas = "*"
-numpy = "*"
-scipy = "*"
-# other dependencies installed at runtime may include datasets, huggingface_hub
+dependencies = [
+    "torch",
+    "pandas",
+    "numpy",
+    "scipy",
+]
