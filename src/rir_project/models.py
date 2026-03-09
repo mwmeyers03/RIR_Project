@@ -51,6 +51,53 @@ class SirenLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(x))
 
 
+class SIRENCoordinateNet(nn.Module):
+    """SIREN MLP that maps (x, y, z, t) coordinates → (p, u_x, u_y, u_z).
+
+    Used as the coordinate network in collocation-based PINN training.
+    All layers use the sinusoidal activation which guarantees smooth,
+    infinitely differentiable outputs — essential for
+    ``torch.autograd.grad``-based physics residuals.
+
+    Parameters
+    ----------
+    hidden_dim : int
+        Width of each hidden SIREN layer.
+    num_layers : int
+        Number of hidden layers (≥ 1).
+    omega_0 : float
+        Frequency multiplier for the first layer.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+        omega_0: float = 30.0,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [SirenLayer(4, hidden_dim, omega_0=omega_0, is_first=True)]
+        for _ in range(num_layers - 1):
+            layers.append(SirenLayer(hidden_dim, hidden_dim, omega_0=omega_0, is_first=False))
+        self.net = nn.Sequential(*layers)
+        self.out = nn.Linear(hidden_dim, 4)  # p, ux, uy, uz
+
+    def forward(self, xyzT: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        xyzT : Tensor[N, 4]
+            Concatenated spatial (x, y, z) and temporal (t) coordinates.
+
+        Returns
+        -------
+        pv : Tensor[N, 4]
+            Predicted pressure (col 0) and velocity (cols 1-3).
+        """
+        return self.out(self.net(xyzT))
+
+
 class MultibandEDCPredictor(nn.Module):
     """LSTM model that maps room features -> multiband EDC."""
 

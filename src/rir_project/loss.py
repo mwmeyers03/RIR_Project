@@ -1,6 +1,6 @@
 """Phase 3: losses used for physics-informed training."""
 
-from typing import List
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -70,6 +70,209 @@ def momentum_residual(pred: torch.Tensor) -> torch.Tensor:
     vel = pred[:, 1:] - pred[:, :-1]
     acc = vel[:, 1:] - vel[:, :-1]
     return torch.mean(acc ** 2)
+
+
+# ---- Proper PINN collocation residuals ----
+
+def acoustic_continuity_residual(
+    pressure: torch.Tensor,
+    velocity: torch.Tensor,
+    coords: torch.Tensor,
+    time: torch.Tensor,
+    rho0: float = 1.225,
+    c: float = 343.0,
+) -> torch.Tensor:
+    """Residual of the acoustic continuity equation at collocation points.
+
+    ∂p/∂t  +  ρ₀ c² ∇·u  =  0
+
+    Parameters
+    ----------
+    pressure : Tensor[N, 1]
+        Acoustic pressure at N collocation points (requires_grad=True path).
+    velocity : Tensor[N, 3]
+        Particle velocity (u_x, u_y, u_z) at the same points.
+    coords : Tensor[N, 3]
+        Spatial coordinates (x, y, z) — must have requires_grad=True.
+    time : Tensor[N, 1]
+        Temporal coordinate — must have requires_grad=True.
+    rho0 : float
+        Equilibrium air density (kg/m³).
+    c : float
+        Speed of sound (m/s).
+
+    Returns
+    -------
+    residual : Tensor[N, 1]
+        Point-wise residual of the continuity equation.
+    """
+    dp_dt = torch.autograd.grad(
+        outputs=pressure,
+        inputs=time,
+        grad_outputs=torch.ones_like(pressure),
+        create_graph=True,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    if dp_dt is None:
+        dp_dt = torch.zeros_like(pressure)
+
+    div_u = torch.zeros_like(pressure)
+    for dim in range(3):
+        du_i_full = torch.autograd.grad(
+            outputs=velocity[:, dim : dim + 1],
+            inputs=coords,
+            grad_outputs=torch.ones_like(pressure),
+            create_graph=True,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        if du_i_full is not None:
+            div_u = div_u + du_i_full[:, dim : dim + 1]
+
+    return dp_dt + rho0 * c ** 2 * div_u
+
+
+def acoustic_momentum_residual(
+    pressure: torch.Tensor,
+    velocity: torch.Tensor,
+    coords: torch.Tensor,
+    time: torch.Tensor,
+    rho0: float = 1.225,
+) -> torch.Tensor:
+    """Residual of the linearized momentum equation at collocation points.
+
+    ρ₀ ∂u/∂t  +  ∇p  =  0
+
+    Parameters
+    ----------
+    pressure : Tensor[N, 1]
+        Acoustic pressure at N collocation points.
+    velocity : Tensor[N, 3]
+        Particle velocity (u_x, u_y, u_z).
+    coords : Tensor[N, 3]
+        Spatial coordinates — must have requires_grad=True.
+    time : Tensor[N, 1]
+        Temporal coordinate — must have requires_grad=True.
+    rho0 : float
+        Equilibrium air density (kg/m³).
+
+    Returns
+    -------
+    residual : Tensor[N, 3]
+        Per-component residual of the momentum equation.
+    """
+    grad_p = torch.autograd.grad(
+        outputs=pressure,
+        inputs=coords,
+        grad_outputs=torch.ones_like(pressure),
+        create_graph=True,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    if grad_p is None:
+        grad_p = torch.zeros(pressure.size(0), 3, device=pressure.device, dtype=pressure.dtype)
+
+    du_dt = torch.autograd.grad(
+        outputs=velocity,
+        inputs=time,
+        grad_outputs=torch.ones_like(velocity),
+        create_graph=True,
+        retain_graph=True,
+        allow_unused=True,
+    )[0]
+    if du_dt is None:
+        du_dt = torch.zeros_like(velocity)
+
+    return rho0 * du_dt + grad_p
+
+
+class CollocationPhysicsLoss(nn.Module):
+    """Physics loss computed over randomly sampled spatial-temporal collocation points.
+
+    Uses a SIREN coordinate network to predict pressure and velocity from
+    (x, y, z, t) coordinates, then enforces the acoustic wave equations
+    via automatic differentiation.  This is the proper PINN formulation:
+    the network is forced to obey acoustic wave propagation laws, not just
+    match the EDC curve.
+
+    Parameters
+    ----------
+    coord_net : nn.Module
+        Network mapping [N, 4] → [N, 4] where outputs are (p, ux, uy, uz).
+    lambda_cont : float
+        Weight for the continuity-equation residual.
+    lambda_mom : float
+        Weight for the momentum-equation residual.
+    rho0 : float
+        Equilibrium air density (kg/m³).
+    c : float
+        Speed of sound (m/s).
+    """
+
+    def __init__(
+        self,
+        coord_net: nn.Module,
+        lambda_cont: float = 0.01,
+        lambda_mom: float = 0.01,
+        rho0: float = 1.225,
+        c: float = 343.0,
+    ) -> None:
+        super().__init__()
+        self.coord_net = coord_net
+        self.lambda_cont = lambda_cont
+        self.lambda_mom = lambda_mom
+        self.rho0 = rho0
+        self.c = c
+
+    def forward(
+        self,
+        room_dims: torch.Tensor,
+        n_points: int = 128,
+    ) -> torch.Tensor:
+        """Sample random collocation points and compute physics loss.
+
+        Parameters
+        ----------
+        room_dims : Tensor[B, 3]
+            Room dimensions (L, W, H) in metres — used to bound sample space.
+        n_points : int
+            Number of collocation points to sample.
+
+        Returns
+        -------
+        loss : scalar Tensor
+            Weighted sum of continuity and momentum residual MSEs.
+        """
+        B = room_dims.size(0)
+        device = room_dims.device
+        dtype = room_dims.dtype
+
+        # Sample spatial coordinates uniformly within the room bounding box.
+        # Use the batch-mean dimensions as the shared bounding box.
+        room_max = room_dims.mean(dim=0).clamp(min=0.1)  # [3]
+        coords = torch.rand(n_points, 3, device=device, dtype=dtype, requires_grad=True)
+        coords_scaled = coords * room_max.unsqueeze(0)  # [N, 3] in metres
+
+        # Sample time in [0, 2 s] (typical RIR range)
+        time = torch.rand(n_points, 1, device=device, dtype=dtype, requires_grad=True) * 2.0
+
+        # Concatenate to a 4-D coordinate vector [N, 4]
+        xyzT = torch.cat([coords_scaled, time], dim=1)  # [N, 4]
+
+        # SIREN network predicts (p, ux, uy, uz) from (x, y, z, t)
+        pv = self.coord_net(xyzT)  # [N, 4]
+        pressure = pv[:, :1]        # [N, 1]
+        velocity = pv[:, 1:]        # [N, 3]
+
+        loss = torch.zeros((), device=device, dtype=dtype)
+        if self.lambda_cont != 0.0:
+            r_cont = acoustic_continuity_residual(pressure, velocity, coords_scaled, time, self.rho0, self.c)
+            loss = loss + self.lambda_cont * torch.mean(r_cont ** 2)
+        if self.lambda_mom != 0.0:
+            r_mom = acoustic_momentum_residual(pressure, velocity, coords_scaled, time, self.rho0)
+            loss = loss + self.lambda_mom * torch.mean(r_mom ** 2)
+        return loss
 
 
 # ---- Multi-Resolution STFT Loss ----

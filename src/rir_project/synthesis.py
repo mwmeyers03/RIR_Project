@@ -1,13 +1,13 @@
-"""Phase 6: synthesis components (bridge, phase reconstructor, full RIR)."""
+"""Phase 6: synthesis components (bridge, phase reconstructor, full RIR)."""
 
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .data import INPUT_DIM, OCTAVE_BANDS
-from .models import DifferentiableFDN
+from .models import DifferentiableFDN, UNetRefiner
 
 
 class ConditionedFDN(nn.Module):
@@ -128,35 +128,111 @@ class SignStickyPhaseReconstructor(nn.Module):
             flips = torch.rand((B, T), device=device) < flip_prob
         else:
             flips = torch.rand((B, T), generator=generator, device=device) < flip_prob
-        # produce sign sequence per batch element
-        signs = torch.ones((B, T), device=device)
-        for b in range(B):
-            for t in range(1, T):
-                if flips[b, t]:
-                    signs[b, t] = -signs[b, t - 1]
-                else:
-                    signs[b, t] = signs[b, t - 1]
+        # vectorised: cumulative XOR via cumsum mod 2
+        flip_cumsum = flips.float().cumsum(dim=1)
+        signs = 1.0 - 2.0 * (flip_cumsum % 2)
         return signs
 
 
+class MultibandSignStickyPhaseReconstructor(nn.Module):
+    """Applies the Sign-Sticky algorithm per frequency band, then sums bands.
+
+    Applying phase reconstruction on a per-band basis preserves the
+    individual decay rates of each octave band, fixing the metallic /
+    spiky artefacts that result from a single broadband envelope.
+
+    Parameters
+    ----------
+    stickiness : float
+        Probability of sign *staying* the same at each step (0-1).
+    seed : int, optional
+        Random seed for reproducible sign sequences.
+    """
+
+    def __init__(self, stickiness: float = 0.90, seed: Optional[int] = None) -> None:
+        super().__init__()
+        self.band_recon = SignStickyPhaseReconstructor(stickiness=stickiness, seed=seed)
+
+    def forward(self, edc_mb: torch.Tensor) -> torch.Tensor:
+        """Reconstruct per-band waveforms and sum.
+
+        Parameters
+        ----------
+        edc_mb : Tensor[B, T, num_bands]
+            Multiband EDC (linear scale, positive, monotonically decreasing).
+
+        Returns
+        -------
+        rir : Tensor[B, T-1]
+            Reconstructed time-domain waveform (sum of band waveforms).
+        """
+        B, T, num_bands = edc_mb.shape
+        band_waveforms: List[torch.Tensor] = []
+        for b in range(num_bands):
+            band_edc = edc_mb[:, :, b]  # [B, T]
+            band_rir = self.band_recon(band_edc)  # [B, T-1]
+            band_waveforms.append(band_rir)
+        # Stack and sum across bands, normalised by number of bands
+        stacked = torch.stack(band_waveforms, dim=1)  # [B, num_bands, T-1]
+        return stacked.sum(dim=1) / num_bands
+
+
 class RIRSynthesiser(nn.Module):
-    def __init__(self, lstm: nn.Module, num_delays: int = 16, sample_rate: int = 16_000, output_length: int = 32_000) -> None:
+    """End-to-end: room parameters -> complete RIR waveform.
+
+    Chains LSTM -> FDN mapper -> Conditioned FDN -> per-band phase reconstruction.
+    Optionally applies the U-Net refiner as a neural post-processor.
+
+    Parameters
+    ----------
+    lstm : nn.Module
+        Trained MultibandEDCPredictor.
+    num_delays : int
+        Number of FDN delay lines.
+    sample_rate : int
+        Audio sample rate in Hz.
+    output_length : int
+        Number of output samples.
+    use_unet : bool
+        If True, appends the UNetRefiner to the synthesis pipeline.
+    stickiness : float
+        Sign-sticky stickiness parameter.
+    """
+
+    def __init__(
+        self,
+        lstm: nn.Module,
+        num_delays: int = 16,
+        sample_rate: int = 16_000,
+        output_length: int = 32_000,
+        use_unet: bool = False,
+        stickiness: float = 0.90,
+    ) -> None:
         super().__init__()
         self.lstm = lstm
         self.mapper = EDCToFDNMapper(num_delays=num_delays)
         self.fdn = ConditionedFDN(num_delays=num_delays, sample_rate=sample_rate, output_length=output_length)
         self.early = EarlyReflections()
-        self.phase_recon = SignStickyPhaseReconstructor()
+        # Per-band phase reconstruction
+        self.mb_phase_recon = MultibandSignStickyPhaseReconstructor(stickiness=stickiness)
+        # Optional U-Net refiner
+        self.unet: Optional[nn.Module] = UNetRefiner(channels=1) if use_unet else None
 
     def forward(self, x: torch.Tensor, return_intermediates: bool = False) -> Dict[str, torch.Tensor]:
-        edc_pred = self.lstm(x)
-        # convert to 1-d EDC by averaging bands for demo
-        edc_1d = edc_pred.mean(dim=2)
+        edc_pred = self.lstm(x)                      # [B, T, bands]
+        edc_1d = edc_pred.mean(dim=2)                # [B, T] broadband
         params = self.mapper(edc_pred, x[:, :3])
         late = self.fdn(edc_1d, params=params)
         early = self.early(edc_1d)
-        phase = self.phase_recon(edc_1d)
-        rir = (early + late) * phase
+        # Clamp EDC to non-negative before per-band phase reconstruction
+        edc_mb_clamped = edc_pred.clamp(min=0.0)
+        phase = self.mb_phase_recon(edc_mb_clamped)  # [B, T-1]
+        # Trim to match FDN length
+        L = min(late.size(1), early.size(1), phase.size(1))
+        rir = (early[:, :L] + late[:, :L]) * phase[:, :L]
+        # Optional U-Net post-processing
+        if self.unet is not None:
+            rir = self.unet(rir.unsqueeze(1)).squeeze(1)
         out = {"rir": rir, "edc_pred": edc_pred, "fdn_params": params}
         if return_intermediates:
             out.update({"phase": phase})
