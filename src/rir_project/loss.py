@@ -19,16 +19,34 @@ class EDCReconstructionLoss(nn.Module):
     Supports both multiband [B, T, F] and broadband [B, T] tensors.
     """
 
-    def __init__(self, early_weight: float = 3.0, slope_weight: float = 0.5) -> None:
+    def __init__(
+        self,
+        early_weight: float = 3.0,
+        slope_weight: float = 0.5,
+        decay_rate: float = 5.0,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        early_weight : float
+            Multiplier applied to the first time step (weight decays to 1.0).
+        slope_weight : float
+            Weight applied to the finite-difference slope-matching penalty.
+        decay_rate : float
+            Controls how quickly the early-emphasis weight decays toward 1.
+            A value of 5.0 means the weight reaches ~1.04× at t=0.6, ensuring
+            about the first 40% of time steps receive elevated emphasis.
+        """
         super().__init__()
         self.early_weight = early_weight
         self.slope_weight = slope_weight
+        self.decay_rate = decay_rate
 
     def forward(self, edc_pred: torch.Tensor, edc_target: torch.Tensor) -> torch.Tensor:
         T = edc_pred.shape[1]
         # Early-emphasis weight: decays from early_weight → 1 over the time axis
         t = torch.arange(T, device=edc_pred.device, dtype=edc_pred.dtype) / T
-        w = 1.0 + (self.early_weight - 1.0) * torch.exp(-5.0 * t)   # [T]
+        w = 1.0 + (self.early_weight - 1.0) * torch.exp(-self.decay_rate * t)  # [T]
         # Broadcast over batch / band dimensions
         if edc_pred.dim() == 3:
             w = w.view(1, T, 1)

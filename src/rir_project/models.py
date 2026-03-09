@@ -269,13 +269,14 @@ class ConvBlock1D(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3):
         super().__init__()
         pad = kernel_size // 2
-        _grp = min(out_ch, 8) if out_ch >= 8 else 1
+        # Groups=min(out_ch, 8) keeps norm well-conditioned for typical channel counts
+        num_groups = min(out_ch, 8) if out_ch >= 8 else 1
         self.net = nn.Sequential(
             nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad),
-            nn.GroupNorm(_grp, out_ch),
+            nn.GroupNorm(num_groups, out_ch),
             nn.ReLU(inplace=True),
             nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad),
-            nn.GroupNorm(_grp, out_ch),
+            nn.GroupNorm(num_groups, out_ch),
             nn.ReLU(inplace=True),
         )
 

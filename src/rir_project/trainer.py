@@ -191,6 +191,8 @@ class RIRTrainer:
         self.optimiser = optim.Adam(params, lr=c.lr, weight_decay=c.weight_decay)
         # CosineAnnealingWarmRestarts provides better convergence than ReduceLROnPlateau
         # for EDC regression; restarts help escape local minima during curriculum phases.
+        # T_0 = max(10, epochs//5): restart every ~20% of total training, but at least
+        # every 10 epochs so early phases get at least one full cosine cycle.
         self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimiser,
             T_0=max(10, c.epochs // 5),
