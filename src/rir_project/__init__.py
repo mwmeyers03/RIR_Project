@@ -46,11 +46,13 @@ from .models import (
 	EncoderBlock,
 	MultiHeadAttentionBottleneck,
 	MultibandEDCPredictor,
+	SirenLayer,
 	SinusoidalPosEncoding,
 	UNetRefiner,
 )
 from .loss import (
 	EDCReconstructionLoss,
+	MultiResolutionSTFTLoss,
 	PhysicsInformedRIRLoss,
 	continuity_residual,
 	momentum_residual,

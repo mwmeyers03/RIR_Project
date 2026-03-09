@@ -280,10 +280,14 @@ def get_dataloader(
     )
     if use_cache:
         ds = CachedRIRDataset(ds)
-    return DataLoader(
-        ds,
+    loader_kwargs: dict = dict(
         batch_size=batch_size,
         shuffle=(shuffle and split == "train"),
         num_workers=num_workers,
         collate_fn=rir_collate_fn,
+        pin_memory=torch.cuda.is_available(),
     )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["persistent_workers"] = True
+    return DataLoader(ds, **loader_kwargs)

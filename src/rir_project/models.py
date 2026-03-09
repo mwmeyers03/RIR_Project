@@ -27,6 +27,30 @@ def _hadamard_matrix(n: int) -> torch.Tensor:
     return H / (n ** 0.5)
 
 
+class SirenLayer(nn.Module):
+    """Sinusoidal representation layer (SIREN) with sine activation.
+
+    Uses ``sin(omega_0 * linear(x))`` to ensure smooth, infinitely
+    differentiable outputs — critical for ``torch.autograd.grad``-based
+    physics residuals.
+    """
+
+    def __init__(self, in_features: int, out_features: int, omega_0: float = 30.0, is_first: bool = False) -> None:
+        super().__init__()
+        self.omega_0 = omega_0
+        self.linear = nn.Linear(in_features, out_features)
+        # SIREN-style initialization
+        with torch.no_grad():
+            if is_first:
+                self.linear.weight.uniform_(-1.0 / in_features, 1.0 / in_features)
+            else:
+                bound = (6.0 / in_features) ** 0.5 / omega_0
+                self.linear.weight.uniform_(-bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sin(self.omega_0 * self.linear(x))
+
+
 class MultibandEDCPredictor(nn.Module):
     """LSTM model that maps room features -> multiband EDC."""
 
@@ -135,16 +159,24 @@ class DifferentiableFDN(nn.Module):
 
 
 class EarlyReflectionNet(nn.Module):
-    """Simple delayed-sum network for first few milliseconds."""
+    """Simple delayed-sum network for the first few milliseconds (43 taps).
+
+    Produces the early-reflection portion of the RIR via a 1-D convolution
+    with learnable tap gains.
+    """
 
     def __init__(self, n_taps: int = 43):
         super().__init__()
-        self.coeffs = nn.Parameter(torch.randn(n_taps))
+        self.n_taps = n_taps
+        self.coeffs = nn.Parameter(torch.randn(n_taps) * 0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, L]; produce early reflection part
-        # naive convolution with fixed delays
-        return x  # placeholder
+        # x: [B, L] — broadband EDC / excitation signal
+        B, L = x.shape
+        # 1-D convolution (delayed-sum): each tap is a weighted, delayed copy
+        kernel = self.coeffs.flip(0).view(1, 1, self.n_taps)
+        out = F.conv1d(x.unsqueeze(1), kernel, padding=self.n_taps - 1)
+        return out.squeeze(1)[:, :L]
 
 
 class ConvBlock1D(nn.Module):

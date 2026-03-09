@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import optim
 
 from .data import DEVICE, INPUT_DIM, get_dataloader
-from .loss import PhysicsInformedRIRLoss
+from .loss import MultiResolutionSTFTLoss, PhysicsInformedRIRLoss
 from .models import DifferentiableFDN, EarlyReflectionNet, MultibandEDCPredictor
 from .synthesis import SignStickyPhaseReconstructor
 from .utils import edc_rmse_db, estimate_rt60, log_spectral_distance, set_seed
@@ -75,6 +75,9 @@ class TrainingConfig:
     save_metrics_path: str = ""
     fdn_plateau_grad_threshold: float = 1e-7
     auto_adjust_max_delay_ms: bool = True
+    use_mr_stft: bool = False
+    mr_stft_weight: float = 1.0
+    mr_stft_windows: str = "512,1024,2048"
 
 
 class RIRTrainer:
@@ -146,7 +149,13 @@ class RIRTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimiser, patience=c.scheduler_patience, factor=c.scheduler_factor
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=c.use_amp and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=c.use_amp and self.device.type == "cuda")
+
+        self.mr_stft_loss = None
+        if c.use_mr_stft:
+            windows = [int(w) for w in c.mr_stft_windows.split(",")]
+            self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows)
+
         self._components_ready = True
 
     def _build_model_only_components(self) -> None:
@@ -168,7 +177,7 @@ class RIRTrainer:
         self.fdn = None
         self.early = None
         self.optimiser = optim.Adam(self.lstm.parameters(), lr=c.lr, weight_decay=c.weight_decay)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=c.use_amp and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=c.use_amp and self.device.type == "cuda")
 
     @staticmethod
     def _git_commit_hash() -> str:
@@ -212,7 +221,7 @@ class RIRTrainer:
         edc_target = torch.randn(batch_size, self.cfg.num_time_steps, self.cfg.num_bands, device=self.device)
 
         self.optimiser.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=self.scaler.is_enabled()):
+        with torch.amp.autocast("cuda", enabled=self.scaler.is_enabled()):
             edc_pred = self.lstm(x)
             loss = self.criterion(edc_pred, edc_target)
         self.scaler.scale(loss).backward()
@@ -287,7 +296,7 @@ class RIRTrainer:
             x = x.to(self.device)
             edc_target = y["edc_mb"].to(self.device)
             self.optimiser.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.scaler.is_enabled()):
+            with torch.amp.autocast("cuda", enabled=self.scaler.is_enabled()):
                 edc_pred = self.lstm(x)
                 loss = self.criterion(edc_pred, edc_target)
                 fdn_loss = torch.zeros((), device=self.device)
