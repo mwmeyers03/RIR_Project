@@ -18,12 +18,29 @@ from .models import MultibandEDCPredictor
 from .synthesis import RIRSynthesiser
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = True) -> None:
+    """Seed Python, NumPy, and PyTorch RNG state.
+
+    When ``deterministic`` is True, this also requests deterministic PyTorch
+    kernels where possible to improve reproducibility between runs.
+    """
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            # Some operators may not support deterministic algorithms.
+            pass
 
 
 seed = set_seed

@@ -92,9 +92,8 @@ class SignStickyPhaseReconstructor(nn.Module):
         super().__init__()
         assert 0.0 <= stickiness <= 1.0
         self.stickiness = stickiness
-        self.rng = torch.Generator()
-        if seed is not None:
-            self.rng.manual_seed(seed)
+        self.seed = seed
+        self._generators: Dict[str, torch.Generator] = {}
 
     def forward(self, edc: torch.Tensor) -> torch.Tensor:
         # edc: [B, T]
@@ -102,13 +101,28 @@ class SignStickyPhaseReconstructor(nn.Module):
         # reverse-diff
         diff = edc[:, :-1] - edc[:, 1:]
         amp = torch.sqrt(torch.clamp(diff, min=0.0))
-        signs = self._sticky_signs(B, T, device=edc.device)
+        signs = self._sticky_signs(B, amp.size(1), device=edc.device)
         return amp * signs
+
+    def _generator_for(self, device: torch.device) -> Optional[torch.Generator]:
+        if self.seed is None:
+            return None
+        key = str(device)
+        if key not in self._generators:
+            gen_device = "cuda" if device.type == "cuda" else "cpu"
+            gen = torch.Generator(device=gen_device)
+            gen.manual_seed(self.seed)
+            self._generators[key] = gen
+        return self._generators[key]
 
     def _sticky_signs(self, B: int, T: int, device: torch.device) -> torch.Tensor:
         # probability of sign flip at each step = 1 - stickiness
         flip_prob = 1.0 - self.stickiness
-        flips = torch.rand((B, T), generator=self.rng, device=device) < flip_prob
+        generator = self._generator_for(device)
+        if generator is None:
+            flips = torch.rand((B, T), device=device) < flip_prob
+        else:
+            flips = torch.rand((B, T), generator=generator, device=device) < flip_prob
         # produce sign sequence per batch element
         signs = torch.ones((B, T), device=device)
         for b in range(B):

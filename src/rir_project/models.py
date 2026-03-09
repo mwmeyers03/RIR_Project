@@ -104,12 +104,34 @@ class DifferentiableFDN(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T] input to FDN
-        _B, _T = x.shape
-        # compute constrained delays in samples
-        kappa = torch.sigmoid(self.log_kappa) * (self.max_delay_ms * self.sample_rate / 1000.0)
-        _kappa = kappa.clamp(min=1.0)  # at least 1 sample
-        # ... rest of FDN recursion implementation omitted for brevity
-        return x  # placeholder
+        B, T = x.shape
+        D = self.num_delays
+
+        # Map unbounded params to stable physical ranges.
+        max_delay_samples = max(1.0, self.max_delay_ms * self.sample_rate / 1000.0)
+        kappa = 1.0 + torch.sigmoid(self.log_kappa) * (max_delay_samples - 1.0)
+        alpha = torch.sigmoid(self.alpha_raw)
+        beta = torch.sigmoid(self.beta_raw)
+
+        # Each delay line is an exponential smoother whose decay is controlled by kappa.
+        decays = torch.exp(-1.0 / kappa).clamp(0.0, 0.9999)
+        states = []
+        for d in range(D):
+            decay = decays[d]
+            prev = torch.zeros(B, device=x.device, dtype=x.dtype)
+            seq = []
+            for t in range(T):
+                prev = decay * prev + x[:, t]
+                seq.append(prev)
+            states.append(torch.stack(seq, dim=1))
+
+        delay_bank = torch.stack(states, dim=1)  # [B, D, T]
+        mixed = torch.einsum("ij,bjt->bit", self.H, delay_bank)
+        out = (alpha.view(1, D, 1) * mixed + beta.view(1, D, 1) * delay_bank).mean(dim=1)
+        return out
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 class EarlyReflectionNet(nn.Module):
