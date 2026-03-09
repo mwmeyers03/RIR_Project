@@ -13,9 +13,15 @@ import torch.nn.functional as F
 from torch import optim
 
 from .data import DEVICE, INPUT_DIM, get_dataloader
-from .loss import MultiResolutionSTFTLoss, PhysicsInformedRIRLoss
-from .models import DifferentiableFDN, EarlyReflectionNet, MultibandEDCPredictor
-from .synthesis import SignStickyPhaseReconstructor
+from .loss import CollocationPhysicsLoss, MultiResolutionSTFTLoss, PhysicsInformedRIRLoss
+from .models import (
+    DifferentiableFDN,
+    EarlyReflectionNet,
+    MultibandEDCPredictor,
+    SIRENCoordinateNet,
+    UNetRefiner,
+)
+from .synthesis import MultibandSignStickyPhaseReconstructor, SignStickyPhaseReconstructor
 from .utils import edc_rmse_db, estimate_rt60, log_spectral_distance, set_seed
 
 
@@ -30,11 +36,11 @@ class TrainingConfig:
     hf_cache_dir: Optional[str] = None
 
     # model
-    hidden_dim: int = 256
-    num_layers: int = 2
+    hidden_dim: int = 512
+    num_layers: int = 3
     num_time_steps: int = 256
     num_bands: int = 6
-    model_dropout: float = 0.1
+    model_dropout: float = 0.05
 
     # FDN
     train_fdn: bool = False
@@ -78,6 +84,22 @@ class TrainingConfig:
     use_mr_stft: bool = False
     mr_stft_weight: float = 1.0
     mr_stft_windows: str = "512,1024,2048"
+
+    # collocation PINN
+    use_collocation: bool = False
+    collocation_n_points: int = 128
+    collocation_lambda_cont: float = 0.01
+    collocation_lambda_mom: float = 0.01
+    siren_hidden_dim: int = 64
+    siren_num_layers: int = 3
+
+    # U-Net refiner
+    use_unet: bool = False
+    unet_weight: float = 1.0
+
+    # curriculum FDN output length (shorter windows speed up early training)
+    fdn_curriculum_length: int = 0  # 0 = disabled; if > 0, use this length until epoch fdn_curriculum_end_epoch
+    fdn_curriculum_end_epoch: int = 10
 
 
 class RIRTrainer:
@@ -129,6 +151,7 @@ class RIRTrainer:
             lambda_mom=c.lambda_mom,
         ).to(self.device)
         self.phase_recon = SignStickyPhaseReconstructor(seed=c.seed)
+        self.mb_phase_recon = MultibandSignStickyPhaseReconstructor()
 
         params = list(self.lstm.parameters())
         self.fdn = None
@@ -145,16 +168,43 @@ class RIRTrainer:
                 self.early = EarlyReflectionNet().to(self.device)
                 params.extend(list(self.early.parameters()))
 
+        self.unet_refiner = None
+        if c.use_unet:
+            self.unet_refiner = UNetRefiner(channels=1).to(self.device)
+            params.extend(list(self.unet_refiner.parameters()))
+
+        # Collocation-based PINN physics loss — build before optimizer so its
+        # parameters are included in the optimizer's param groups.
+        self.collocation_loss = None
+        if c.use_collocation:
+            coord_net = SIRENCoordinateNet(
+                hidden_dim=c.siren_hidden_dim,
+                num_layers=c.siren_num_layers,
+            ).to(self.device)
+            params.extend(list(coord_net.parameters()))
+            self.collocation_loss = CollocationPhysicsLoss(
+                coord_net=coord_net,
+                lambda_cont=c.collocation_lambda_cont,
+                lambda_mom=c.collocation_lambda_mom,
+            ).to(self.device)
+
         self.optimiser = optim.Adam(params, lr=c.lr, weight_decay=c.weight_decay)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimiser, patience=c.scheduler_patience, factor=c.scheduler_factor
+        # CosineAnnealingWarmRestarts provides better convergence than ReduceLROnPlateau
+        # for EDC regression; restarts help escape local minima during curriculum phases.
+        # T_0 = max(10, epochs//5): restart every ~20% of total training, but at least
+        # every 10 epochs so early phases get at least one full cosine cycle.
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimiser,
+            T_0=max(10, c.epochs // 5),
+            T_mult=1,
+            eta_min=c.lr * 1e-3,
         )
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
         self.mr_stft_loss = None
         if c.use_mr_stft:
             windows = [int(w) for w in c.mr_stft_windows.split(",")]
-            self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows)
+            self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows).to(self.device)
 
         self._components_ready = True
 
@@ -174,8 +224,12 @@ class RIRTrainer:
             lambda_mom=c.lambda_mom,
         ).to(self.device)
         self.phase_recon = SignStickyPhaseReconstructor(seed=c.seed)
+        self.mb_phase_recon = MultibandSignStickyPhaseReconstructor()
         self.fdn = None
         self.early = None
+        self.unet_refiner = None
+        self.mr_stft_loss = None
+        self.collocation_loss = None
         self.optimiser = optim.Adam(self.lstm.parameters(), lr=c.lr, weight_decay=c.weight_decay)
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
@@ -266,7 +320,9 @@ class RIRTrainer:
             if self.cfg.early_late_split and self.early is not None:
                 return late + self.early(edc_1d)
             return late
-        return self.phase_recon(edc_1d)
+        # Use multiband phase reconstruction (fixes metallic artefacts from single broadband)
+        edc_mb_clamped = edc_pred.clamp(min=0.0)
+        return self.mb_phase_recon(edc_mb_clamped)
 
     @staticmethod
     def _acoustic_metrics(pred: np.ndarray, ref: np.ndarray, sample_rate: int) -> Dict[str, float]:
@@ -281,12 +337,21 @@ class RIRTrainer:
             "edc_rmse": edc_rmse_db(p, r),
         }
 
+    def _effective_fdn_output_length(self, epoch: int) -> int:
+        """Return the FDN output length, applying curriculum shortening if enabled."""
+        c = self.cfg
+        if c.fdn_curriculum_length > 0 and epoch < c.fdn_curriculum_end_epoch:
+            return c.fdn_curriculum_length
+        return c.fdn_output_length
+
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.lstm.train()
         if self.fdn is not None:
             self.fdn.train()
         if self.early is not None:
             self.early.train()
+        if self.unet_refiner is not None:
+            self.unet_refiner.train()
         self._apply_curriculum(epoch)
         total_loss = 0.0
         total_fdn_loss = 0.0
@@ -306,6 +371,15 @@ class RIRTrainer:
                     L = min(rir_pred.shape[1], rir_target.shape[1])
                     fdn_loss = F.mse_loss(rir_pred[:, :L], rir_target[:, :L])
                     loss = loss + self.cfg.fdn_weight * fdn_loss
+                    # MR-STFT loss applied to time-domain RIR when FDN is active
+                    if self.mr_stft_loss is not None:
+                        mr_loss = self.mr_stft_loss(rir_pred[:, :L].float(), rir_target[:, :L].float())
+                        loss = loss + self.cfg.mr_stft_weight * mr_loss
+                # Collocation-based PINN physics loss
+                if self.collocation_loss is not None:
+                    room_dims = x[:, :3].clamp(min=0.1)
+                    coll_loss = self.collocation_loss(room_dims, n_points=self.cfg.collocation_n_points)
+                    loss = loss + coll_loss
             self.scaler.scale(loss).backward()
 
             grad_norm = 0.0
@@ -337,6 +411,8 @@ class RIRTrainer:
             self.fdn.eval()
         if self.early is not None:
             self.early.eval()
+        if self.unet_refiner is not None:
+            self.unet_refiner.eval()
         total_loss = 0.0
         total_fdn_loss = 0.0
         metric_count = 0
@@ -420,7 +496,7 @@ class RIRTrainer:
             history["fdn_loss"].append(val_metrics.get("fdn", 0.0))
             history["log_kappa_grad_norm"].append(train_metrics.get("log_kappa_grad_norm", 0.0))
 
-            self.scheduler.step(val_metrics["total"])
+            self.scheduler.step()
             if (epoch + 1) % self.cfg.log_every == 0:
                 print(
                     f"Epoch {epoch+1}/{self.cfg.epochs} "

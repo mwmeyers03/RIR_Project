@@ -51,17 +51,70 @@ class SirenLayer(nn.Module):
         return torch.sin(self.omega_0 * self.linear(x))
 
 
+class SIRENCoordinateNet(nn.Module):
+    """SIREN MLP that maps (x, y, z, t) coordinates → (p, u_x, u_y, u_z).
+
+    Used as the coordinate network in collocation-based PINN training.
+    All layers use the sinusoidal activation which guarantees smooth,
+    infinitely differentiable outputs — essential for
+    ``torch.autograd.grad``-based physics residuals.
+
+    Parameters
+    ----------
+    hidden_dim : int
+        Width of each hidden SIREN layer.
+    num_layers : int
+        Number of hidden layers (≥ 1).
+    omega_0 : float
+        Frequency multiplier for the first layer.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        num_layers: int = 3,
+        omega_0: float = 30.0,
+    ) -> None:
+        super().__init__()
+        layers: list[nn.Module] = [SirenLayer(4, hidden_dim, omega_0=omega_0, is_first=True)]
+        for _ in range(num_layers - 1):
+            layers.append(SirenLayer(hidden_dim, hidden_dim, omega_0=omega_0, is_first=False))
+        self.net = nn.Sequential(*layers)
+        self.out = nn.Linear(hidden_dim, 4)  # p, ux, uy, uz
+
+    def forward(self, xyzT: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        xyzT : Tensor[N, 4]
+            Concatenated spatial (x, y, z) and temporal (t) coordinates.
+
+        Returns
+        -------
+        pv : Tensor[N, 4]
+            Predicted pressure (col 0) and velocity (cols 1-3).
+        """
+        return self.out(self.net(xyzT))
+
+
 class MultibandEDCPredictor(nn.Module):
-    """LSTM model that maps room features -> multiband EDC."""
+    """LSTM model that maps room features -> multiband EDC.
+
+    Uses LayerNorm (not BatchNorm1d) so it works correctly when
+    batch_size == 1 (which would otherwise crash BatchNorm).
+    The output is constrained to be monotonically decreasing via
+    softplus cumsum, ensuring physically realistic EDC curves.
+    """
 
     def __init__(
         self,
         input_dim: int = INPUT_DIM,
-        hidden_dim: int = 256,
-        num_layers: int = 2,
+        hidden_dim: int = 512,
+        num_layers: int = 3,
         num_time_steps: int = 256,
         num_bands: int = len(OCTAVE_BANDS),
-        dropout: float = 0.1,
+        dropout: float = 0.05,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
@@ -71,25 +124,53 @@ class MultibandEDCPredictor(nn.Module):
         self.num_bands = num_bands
         self.dropout = dropout
 
+        # LayerNorm normalises over the feature dimension and works for any batch
+        # size (including B=1), unlike BatchNorm1d which requires B>1 in training.
+        self.input_norm = nn.LayerNorm(input_dim)
+
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.h0_proj = nn.Linear(hidden_dim, num_layers * hidden_dim)
+        self.c0_proj = nn.Linear(hidden_dim, num_layers * hidden_dim)
+        self.time_embed = nn.Parameter(
+            torch.randn(1, num_time_steps, hidden_dim) * 0.02
+        )
         self.lstm = nn.LSTM(
-            input_dim,
-            hidden_dim,
-            num_layers,
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.head = nn.Linear(hidden_dim, num_time_steps * num_bands)
+        # Two-layer head: produces log-decrements for monotonic EDC
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, num_bands),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, input_dim] -> expand to sequence length 1
+        # x: [B, input_dim]
         B = x.size(0)
-        h0 = torch.zeros(self.num_layers, B, self.hidden_dim, device=x.device)
-        c0 = torch.zeros(self.num_layers, B, self.hidden_dim, device=x.device)
-        out, _ = self.lstm(x.unsqueeze(1), (h0, c0))  # [B,1,hidden]
-        out = out[:, -1, :]
-        edc = self.head(out)
-        edc = edc.view(B, self.num_time_steps, self.num_bands)
-        return edc
+        # LayerNorm normalises over the last dim (input_dim), works for any B
+        x = self.input_norm(x)                        # [B, input_dim]
+        ctx = self.encoder(x)                         # [B, hidden]
+        h0 = self.h0_proj(ctx).view(B, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        c0 = self.c0_proj(ctx).view(B, self.num_layers, self.hidden_dim).permute(1, 0, 2).contiguous()
+        lstm_in = self.time_embed.expand(B, -1, -1)
+        lstm_out, _ = self.lstm(lstm_in, (h0, c0))   # [B, T, hidden]
+        # Monotonically-decreasing dB EDC via softplus + cumsum
+        log_dec = self.head(lstm_out)                 # [B, T, num_bands]
+        decrements = F.softplus(log_dec) * 0.5
+        edc_pred = -torch.cumsum(decrements, dim=1)   # [B, T, num_bands]
+        return edc_pred
 
 
 class DifferentiableFDN(nn.Module):
@@ -180,15 +261,22 @@ class EarlyReflectionNet(nn.Module):
 
 
 class ConvBlock1D(nn.Module):
+    """Conv1D → GroupNorm → ReLU (× 2).
+
+    GroupNorm instead of BatchNorm so this works with any batch size, including B=1.
+    """
+
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3):
         super().__init__()
         pad = kernel_size // 2
+        # Groups=min(out_ch, 8) keeps norm well-conditioned for typical channel counts
+        num_groups = min(out_ch, 8) if out_ch >= 8 else 1
         self.net = nn.Sequential(
             nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad),
-            nn.BatchNorm1d(out_ch),
+            nn.GroupNorm(num_groups, out_ch),
             nn.ReLU(inplace=True),
             nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad),
-            nn.BatchNorm1d(out_ch),
+            nn.GroupNorm(num_groups, out_ch),
             nn.ReLU(inplace=True),
         )
 

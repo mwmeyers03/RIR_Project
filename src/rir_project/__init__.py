@@ -46,14 +46,18 @@ from .models import (
 	EncoderBlock,
 	MultiHeadAttentionBottleneck,
 	MultibandEDCPredictor,
+	SIRENCoordinateNet,
 	SirenLayer,
 	SinusoidalPosEncoding,
 	UNetRefiner,
 )
 from .loss import (
+	CollocationPhysicsLoss,
 	EDCReconstructionLoss,
 	MultiResolutionSTFTLoss,
 	PhysicsInformedRIRLoss,
+	acoustic_continuity_residual,
+	acoustic_momentum_residual,
 	continuity_residual,
 	momentum_residual,
 )
@@ -62,6 +66,7 @@ from .synthesis import (
 	ConditionedFDN,
 	EDCToFDNMapper,
 	EarlyReflections,
+	MultibandSignStickyPhaseReconstructor,
 	RIRSynthesiser,
 	SignStickyPhaseReconstructor,
 )
