@@ -36,11 +36,11 @@ class TrainingConfig:
     hf_cache_dir: Optional[str] = None
 
     # model
-    hidden_dim: int = 256
-    num_layers: int = 2
+    hidden_dim: int = 512
+    num_layers: int = 3
     num_time_steps: int = 256
     num_bands: int = 6
-    model_dropout: float = 0.1
+    model_dropout: float = 0.05
 
     # FDN
     train_fdn: bool = False
@@ -189,8 +189,13 @@ class RIRTrainer:
             ).to(self.device)
 
         self.optimiser = optim.Adam(params, lr=c.lr, weight_decay=c.weight_decay)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimiser, patience=c.scheduler_patience, factor=c.scheduler_factor
+        # CosineAnnealingWarmRestarts provides better convergence than ReduceLROnPlateau
+        # for EDC regression; restarts help escape local minima during curriculum phases.
+        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimiser,
+            T_0=max(10, c.epochs // 5),
+            T_mult=1,
+            eta_min=c.lr * 1e-3,
         )
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
@@ -489,7 +494,7 @@ class RIRTrainer:
             history["fdn_loss"].append(val_metrics.get("fdn", 0.0))
             history["log_kappa_grad_norm"].append(train_metrics.get("log_kappa_grad_norm", 0.0))
 
-            self.scheduler.step(val_metrics["total"])
+            self.scheduler.step()
             if (epoch + 1) % self.cfg.log_every == 0:
                 print(
                     f"Epoch {epoch+1}/{self.cfg.epochs} "

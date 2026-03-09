@@ -8,14 +8,40 @@ import torch.nn.functional as F
 
 
 class EDCReconstructionLoss(nn.Module):
-    """Simple EDC reconstruction criterion."""
+    """Weighted RMSE between predicted and target EDC (dB).
 
-    def __init__(self, reduction: str = "mean") -> None:
+    Standard RMSE treats all dB levels equally, but early-decay structure
+    is perceptually and physically more important than the noise floor.
+    This loss adds:
+      1. Early-emphasis weighting (higher weight in first 25% of time steps)
+      2. Slope-matching penalty that encourages correct RT60 gradient
+
+    Supports both multiband [B, T, F] and broadband [B, T] tensors.
+    """
+
+    def __init__(self, early_weight: float = 3.0, slope_weight: float = 0.5) -> None:
         super().__init__()
-        self.reduction = reduction
+        self.early_weight = early_weight
+        self.slope_weight = slope_weight
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return F.mse_loss(pred, target, reduction=self.reduction)
+    def forward(self, edc_pred: torch.Tensor, edc_target: torch.Tensor) -> torch.Tensor:
+        T = edc_pred.shape[1]
+        # Early-emphasis weight: decays from early_weight → 1 over the time axis
+        t = torch.arange(T, device=edc_pred.device, dtype=edc_pred.dtype) / T
+        w = 1.0 + (self.early_weight - 1.0) * torch.exp(-5.0 * t)   # [T]
+        # Broadcast over batch / band dimensions
+        if edc_pred.dim() == 3:
+            w = w.view(1, T, 1)
+        else:
+            w = w.view(1, T)
+        # 1. Weighted RMSE
+        diff = (edc_pred - edc_target) * w
+        rmse = torch.sqrt(torch.mean(diff ** 2) + 1e-8)
+        # 2. Slope penalty: finite-difference along time axis
+        slope_pred = edc_pred[:, 1:] - edc_pred[:, :-1]
+        slope_tgt  = edc_target[:, 1:] - edc_target[:, :-1]
+        slope_loss = torch.sqrt(torch.mean((slope_pred - slope_tgt) ** 2) + 1e-8)
+        return rmse + self.slope_weight * slope_loss
 
 
 def continuity_residual(pred: torch.Tensor) -> torch.Tensor:
@@ -338,10 +364,11 @@ class PhysicsInformedRIRLoss(nn.Module):
         super().__init__()
         self.lambda_cont = lambda_cont
         self.lambda_mom = lambda_mom
+        self.edc_loss = EDCReconstructionLoss(early_weight=3.0, slope_weight=0.5)
 
     def forward(self, edc_pred: torch.Tensor, edc_target: torch.Tensor) -> torch.Tensor:
         # edc_pred, edc_target: [B, T, bands]
-        loss = F.mse_loss(edc_pred, edc_target)
+        loss = self.edc_loss(edc_pred, edc_target)
         if self.lambda_cont != 0.0:
             loss = loss + self.lambda_cont * self._continuity(edc_pred, edc_target)
         if self.lambda_mom != 0.0:
