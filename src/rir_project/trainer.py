@@ -149,7 +149,7 @@ class RIRTrainer:
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimiser, patience=c.scheduler_patience, factor=c.scheduler_factor
         )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=c.use_amp and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
         self.mr_stft_loss = None
         if c.use_mr_stft:
@@ -177,7 +177,7 @@ class RIRTrainer:
         self.fdn = None
         self.early = None
         self.optimiser = optim.Adam(self.lstm.parameters(), lr=c.lr, weight_decay=c.weight_decay)
-        self.scaler = torch.amp.GradScaler("cuda", enabled=c.use_amp and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
     @staticmethod
     def _git_commit_hash() -> str:
