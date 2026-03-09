@@ -151,6 +151,7 @@ class RIRTrainer:
             lambda_mom=c.lambda_mom,
         ).to(self.device)
         self.phase_recon = SignStickyPhaseReconstructor(seed=c.seed)
+        self.mb_phase_recon = MultibandSignStickyPhaseReconstructor()
 
         params = list(self.lstm.parameters())
         self.fdn = None
@@ -172,18 +173,8 @@ class RIRTrainer:
             self.unet_refiner = UNetRefiner(channels=1).to(self.device)
             params.extend(list(self.unet_refiner.parameters()))
 
-        self.optimiser = optim.Adam(params, lr=c.lr, weight_decay=c.weight_decay)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimiser, patience=c.scheduler_patience, factor=c.scheduler_factor
-        )
-        self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
-
-        self.mr_stft_loss = None
-        if c.use_mr_stft:
-            windows = [int(w) for w in c.mr_stft_windows.split(",")]
-            self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows).to(self.device)
-
-        # Collocation-based PINN physics loss
+        # Collocation-based PINN physics loss — build before optimizer so its
+        # parameters are included in the optimizer's param groups.
         self.collocation_loss = None
         if c.use_collocation:
             coord_net = SIRENCoordinateNet(
@@ -196,6 +187,17 @@ class RIRTrainer:
                 lambda_cont=c.collocation_lambda_cont,
                 lambda_mom=c.collocation_lambda_mom,
             ).to(self.device)
+
+        self.optimiser = optim.Adam(params, lr=c.lr, weight_decay=c.weight_decay)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimiser, patience=c.scheduler_patience, factor=c.scheduler_factor
+        )
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
+
+        self.mr_stft_loss = None
+        if c.use_mr_stft:
+            windows = [int(w) for w in c.mr_stft_windows.split(",")]
+            self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows).to(self.device)
 
         self._components_ready = True
 
@@ -215,6 +217,7 @@ class RIRTrainer:
             lambda_mom=c.lambda_mom,
         ).to(self.device)
         self.phase_recon = SignStickyPhaseReconstructor(seed=c.seed)
+        self.mb_phase_recon = MultibandSignStickyPhaseReconstructor()
         self.fdn = None
         self.early = None
         self.unet_refiner = None
@@ -310,11 +313,9 @@ class RIRTrainer:
             if self.cfg.early_late_split and self.early is not None:
                 return late + self.early(edc_1d)
             return late
-        # Use multiband phase reconstruction when available (fixes metallic artefacts)
+        # Use multiband phase reconstruction (fixes metallic artefacts from single broadband)
         edc_mb_clamped = edc_pred.clamp(min=0.0)
-        from .synthesis import MultibandSignStickyPhaseReconstructor
-        mb_recon = MultibandSignStickyPhaseReconstructor()
-        return mb_recon(edc_mb_clamped)
+        return self.mb_phase_recon(edc_mb_clamped)
 
     @staticmethod
     def _acoustic_metrics(pred: np.ndarray, ref: np.ndarray, sample_rate: int) -> Dict[str, float]:

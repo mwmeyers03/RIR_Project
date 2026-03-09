@@ -174,7 +174,7 @@ class MultibandSignStickyPhaseReconstructor(nn.Module):
             band_waveforms.append(band_rir)
         # Stack and sum across bands, normalised by number of bands
         stacked = torch.stack(band_waveforms, dim=1)  # [B, num_bands, T-1]
-        return stacked.sum(dim=1) / num_bands
+        return stacked.mean(dim=1)
 
 
 class RIRSynthesiser(nn.Module):
