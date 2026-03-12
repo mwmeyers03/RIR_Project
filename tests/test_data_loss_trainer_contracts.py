@@ -15,6 +15,7 @@ if str(SRC) not in sys.path:
 from rir_project.data import INPUT_DIM, METRICS_DIM, RIRMegaDataset
 from rir_project.loss import PhysicsInformedRIRLoss
 from rir_project.trainer import RIRTrainer, TrainingConfig
+from rir_project.utils import generate_rir_from_params
 
 
 class _FakeHF(list):
@@ -130,3 +131,36 @@ def test_trainer_fit_dry_run_without_full_data(monkeypatch: pytest.MonkeyPatch) 
     assert len(history["train_loss"]) == 1
     assert len(history["val_loss"]) == 1
     assert isinstance(history["train_loss"][0], float)
+
+
+def test_amp_autocast_uses_device_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PERF-03: autocast must use self.device.type, not hardcoded 'cuda'."""
+    import rir_project.trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, "get_dataloader", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("no data")))
+
+    cfg = TrainingConfig(
+        dry_run=True, use_amp=False, hidden_dim=16, num_layers=1,
+        num_time_steps=8, num_bands=2, seed=0,
+    )
+    trainer = RIRTrainer(cfg)
+    # The device is 'cpu' in the test environment; if autocast was
+    # hardcoded to "cuda" this would raise on some PyTorch versions.
+    assert trainer.device.type == "cpu"
+    history = trainer.fit()
+    assert isinstance(history["train_loss"][0], float)
+
+
+def test_generate_rir_from_params_validates_input_dim() -> None:
+    """QUAL-04: generate_rir_from_params should raise on wrong feature dim."""
+    from rir_project.models import MultibandEDCPredictor
+    from rir_project.synthesis import RIRSynthesiser
+
+    lstm = MultibandEDCPredictor(
+        input_dim=INPUT_DIM, hidden_dim=16, num_layers=1, num_time_steps=8, num_bands=2
+    )
+    synth = RIRSynthesiser(lstm=lstm, output_length=64)
+    # Wrong number of features should raise ValueError
+    x_wrong = torch.randn(1, INPUT_DIM - 1)
+    with pytest.raises(ValueError, match="Feature vector has"):
+        generate_rir_from_params(synth, x_wrong)
