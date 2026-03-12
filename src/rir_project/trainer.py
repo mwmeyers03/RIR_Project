@@ -275,7 +275,7 @@ class RIRTrainer:
         edc_target = torch.randn(batch_size, self.cfg.num_time_steps, self.cfg.num_bands, device=self.device)
 
         self.optimiser.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=self.scaler.is_enabled()):
+        with torch.amp.autocast(self.device.type, enabled=self.scaler.is_enabled()):
             edc_pred = self.lstm(x)
             loss = self.criterion(edc_pred, edc_target)
         self.scaler.scale(loss).backward()
@@ -379,7 +379,7 @@ class RIRTrainer:
             x = x.to(self.device)
             edc_target = y["edc_mb"].to(self.device)
             self.optimiser.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=self.scaler.is_enabled()):
+            with torch.amp.autocast(self.device.type, enabled=self.scaler.is_enabled()):
                 edc_pred = self.lstm(x)
                 loss = self.criterion(edc_pred, edc_target)
                 fdn_loss = torch.zeros((), device=self.device)

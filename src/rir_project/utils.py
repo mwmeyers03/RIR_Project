@@ -87,6 +87,8 @@ def compute_drr(rir: np.ndarray, sample_rate: int = 16_000, direct_ms: float = 2
 
 
 def generate_rir_from_params(synth: RIRSynthesiser, x: torch.Tensor, device: str = str(DEVICE)) -> Dict[str, Any]:
+    if x.shape[-1] != INPUT_DIM:
+        raise ValueError(f"Feature vector has {x.shape[-1]} dims, expected {INPUT_DIM}")
     synth = synth.to(device)
     synth.eval()
     with torch.no_grad():
