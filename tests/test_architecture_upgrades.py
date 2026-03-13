@@ -6,6 +6,8 @@ acoustic residuals, MultibandSignStickyPhaseReconstructor, and UNetRefiner."""
 import sys
 from pathlib import Path
 
+import numpy as np
+import pytest
 import torch
 
 # Ensure src/ layout is importable when tests run from repo root.
@@ -23,7 +25,9 @@ from rir_project.loss import (
     momentum_residual,
 )
 from rir_project.models import EarlyReflectionNet, SIRENCoordinateNet, SirenLayer, UNetRefiner
-from rir_project.synthesis import EarlyReflections, MultibandSignStickyPhaseReconstructor
+from rir_project.synthesis import EarlyReflections, MultibandSignStickyPhaseReconstructor, RIRSynthesiser
+from rir_project.utils import compute_drr
+from rir_project.models import MultibandEDCPredictor
 
 
 def test_siren_layer_output_shape() -> None:
@@ -221,3 +225,122 @@ def test_unet_refiner_shape_preserved() -> None:
     x = torch.randn(2, 1, 512)
     y = net(x)
     assert y.shape == x.shape
+
+
+def test_unet_refiner_has_gamma_parameter() -> None:
+    """UNetRefiner must expose a learnable gamma parameter for residual scaling."""
+    net = UNetRefiner(channels=1, base=8)
+    assert hasattr(net, "gamma"), "UNetRefiner must have a 'gamma' parameter"
+    assert isinstance(net.gamma, torch.nn.Parameter)
+    assert float(net.gamma.item()) == pytest.approx(0.01, abs=1e-6)
+
+
+def test_unet_refiner_residual_output() -> None:
+    """UNetRefiner output should be x + gamma * unet_internal_output (not raw unet output)."""
+    net = UNetRefiner(channels=1, base=8)
+    with torch.no_grad():
+        # Force gamma to zero -> output must equal x
+        net.gamma.fill_(0.0)
+    x = torch.randn(2, 1, 256)
+    with torch.no_grad():
+        y = net(x)
+    assert torch.allclose(y, x, atol=1e-5), "With gamma=0, UNetRefiner output must equal input"
+
+
+def test_unet_refiner_gradients_flow_through_gamma() -> None:
+    """Gradients must flow through gamma so the residual scale is learnable."""
+    net = UNetRefiner(channels=1, base=8)
+    x = torch.randn(2, 1, 256)
+    y = net(x)
+    y.sum().backward()
+    assert net.gamma.grad is not None, "gamma must receive gradients"
+
+
+# ---- compute_drr fix tests ----
+
+_DRR_TEST_LEN = 1600
+
+
+def test_compute_drr_no_nan_when_direct_energy_near_zero() -> None:
+    """compute_drr must not return NaN even when the direct window energy is ~0."""
+    rir = np.zeros(_DRR_TEST_LEN, dtype=np.float32)
+    rir[_DRR_TEST_LEN // 2 :] = 0.1  # energy only in reverb tail, direct window is silent
+    result = compute_drr(rir, sample_rate=16_000, direct_ms=2.5)
+    assert not np.isnan(result), "compute_drr must return finite value when direct window is silent"
+
+
+def test_compute_drr_no_nan_when_both_windows_near_zero() -> None:
+    """compute_drr must not return NaN when both windows have near-zero energy."""
+    rir = np.zeros(_DRR_TEST_LEN, dtype=np.float32)
+    result = compute_drr(rir, sample_rate=16_000, direct_ms=2.5)
+    assert not np.isnan(result), "compute_drr must return finite value for all-zero RIR"
+
+
+def test_compute_drr_typical_value() -> None:
+    """compute_drr should return a finite number for a typical impulse-like RIR."""
+    rng = np.random.default_rng(42)
+    rir = rng.standard_normal(16_000).astype(np.float32)
+    result = compute_drr(rir, sample_rate=16_000, direct_ms=2.5)
+    assert np.isfinite(result)
+
+
+# ---- RIRSynthesiser.forward() train_fdn fix tests ----
+
+def _make_synthesiser(train_fdn: bool = True) -> RIRSynthesiser:
+    lstm = MultibandEDCPredictor(
+        input_dim=15,
+        hidden_dim=32,
+        num_layers=1,
+        num_time_steps=64,
+        num_bands=6,
+    )
+    return RIRSynthesiser(
+        lstm=lstm,
+        num_delays=4,
+        sample_rate=16_000,
+        output_length=256,
+        use_unet=False,
+        train_fdn=train_fdn,
+    )
+
+
+def test_rir_synthesiser_train_fdn_output_finite() -> None:
+    """RIRSynthesiser with train_fdn=True must produce finite waveforms."""
+    synth = _make_synthesiser(train_fdn=True)
+    x = torch.randn(2, 15)
+    with torch.no_grad():
+        out = synth(x)
+    assert torch.isfinite(out["rir"]).all(), "RIR output must be finite when train_fdn=True"
+
+
+def test_rir_synthesiser_train_fdn_gradients_flow() -> None:
+    """Gradients must flow to FDN parameters when train_fdn=True."""
+    synth = _make_synthesiser(train_fdn=True)
+    x = torch.randn(2, 15)
+    out = synth(x)
+    out["rir"].sum().backward()
+    # FDN log_kappa must have received gradients
+    assert synth.fdn.fdn.log_kappa.grad is not None, "FDN log_kappa must have gradients when train_fdn=True"
+    assert synth.fdn.fdn.log_kappa.grad.abs().sum().item() > 0.0, "FDN gradients must be non-zero"
+
+
+def test_rir_synthesiser_train_fdn_peak_normalised() -> None:
+    """RIRSynthesiser output must be peak-normalised to ~[-1, 1] when train_fdn=True."""
+    synth = _make_synthesiser(train_fdn=True)
+    x = torch.randn(2, 15)
+    with torch.no_grad():
+        out = synth(x)
+    rir = out["rir"]
+    max_abs = rir.abs().max(dim=-1).values
+    # After peak normalisation each sample should have max abs ≤ 1 + tiny epsilon tolerance
+    assert (max_abs <= 1.0 + 1e-4).all(), "Peak-normalised RIR must have max abs ≤ 1"
+
+
+def test_rir_synthesiser_fallback_uses_phase_recon() -> None:
+    """With train_fdn=False, RIRSynthesiser must use phase reconstruction and produce finite output."""
+    synth = _make_synthesiser(train_fdn=False)
+    x = torch.randn(2, 15)
+    with torch.no_grad():
+        out = synth(x, return_intermediates=True)
+    assert torch.isfinite(out["rir"]).all()
+    assert "phase" in out, "Intermediates must include 'phase' when train_fdn=False"
