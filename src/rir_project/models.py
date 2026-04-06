@@ -335,7 +335,14 @@ class MultiHeadAttentionBottleneck(nn.Module):
 
 
 class UNetRefiner(nn.Module):
-    """Compact U-Net refiner for optional post-processing."""
+    """Compact U-Net refiner for optional post-processing.
+
+    Acts as a residual network: output = x + gamma * unet_output,
+    where gamma is a small learnable parameter initialised to 0.01.
+    This ensures the U-Net makes only micro-adjustments to the input
+    (e.g. phase/harmonic corrections) without overwriting the
+    macroscopic exponential decay produced by the FDN.
+    """
 
     def __init__(self, channels: int = 1, base: int = 16):
         super().__init__()
@@ -345,11 +352,15 @@ class UNetRefiner(nn.Module):
         self.dec2 = DecoderBlock(base * 4, base * 2, base * 2)
         self.dec1 = DecoderBlock(base * 2, base, base)
         self.out = nn.Conv1d(base, channels, kernel_size=1)
+        # Small learnable residual scale: U-Net makes micro-adjustments only.
+        self.gamma = nn.Parameter(torch.tensor(0.01))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        s1, p1 = self.enc1(x)
-        s2, p2 = self.enc2(p1)
-        b = self.bottleneck(p2)
-        d2 = self.dec2(b, s2)
-        d1 = self.dec1(d2, s1)
-        return self.out(d1)
+        with torch.autocast(device_type="cuda"):
+            s1, p1 = self.enc1(x)
+            s2, p2 = self.enc2(p1)
+            b = self.bottleneck(p2)
+            d2 = self.dec2(b, s2)
+            d1 = self.dec1(d2, s1)
+            unet_out = self.out(d1)
+        return x + self.gamma * unet_out

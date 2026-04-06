@@ -83,7 +83,7 @@ def compute_drr(rir: np.ndarray, sample_rate: int = 16_000, direct_ms: float = 2
     n_direct = max(1, int((direct_ms / 1000.0) * sample_rate))
     direct = np.sum(rir[:n_direct] ** 2)
     reverb = np.sum(rir[n_direct:] ** 2)
-    return float(10.0 * np.log10((direct + 1e-12) / (reverb + 1e-12)))
+    return float(10.0 * np.log10((direct + 1e-8) / (reverb + 1e-8)))
 
 
 def generate_rir_from_params(synth: RIRSynthesiser, x: torch.Tensor, device: str = str(DEVICE)) -> Dict[str, Any]:

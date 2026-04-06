@@ -207,13 +207,15 @@ class RIRSynthesiser(nn.Module):
         output_length: int = 32_000,
         use_unet: bool = False,
         stickiness: float = 0.90,
+        train_fdn: bool = True,
     ) -> None:
         super().__init__()
         self.lstm = lstm
+        self.train_fdn = train_fdn
         self.mapper = EDCToFDNMapper(num_delays=num_delays)
         self.fdn = ConditionedFDN(num_delays=num_delays, sample_rate=sample_rate, output_length=output_length)
         self.early = EarlyReflections()
-        # Per-band phase reconstruction
+        # Per-band phase reconstruction (fallback when train_fdn=False)
         self.mb_phase_recon = MultibandSignStickyPhaseReconstructor(stickiness=stickiness)
         # Optional U-Net refiner
         self.unet: Optional[nn.Module] = UNetRefiner(channels=1) if use_unet else None
@@ -224,16 +226,25 @@ class RIRSynthesiser(nn.Module):
         params = self.mapper(edc_pred, x[:, :3])
         late = self.fdn(edc_1d, params=params)
         early = self.early(edc_1d)
-        # Clamp EDC to non-negative before per-band phase reconstruction
-        edc_mb_clamped = edc_pred.clamp(min=0.0)
-        phase = self.mb_phase_recon(edc_mb_clamped)  # [B, T-1]
-        # Trim to match FDN length
-        L = min(late.size(1), early.size(1), phase.size(1))
-        rir = (early[:, :L] + late[:, :L]) * phase[:, :L]
+        phase: Optional[torch.Tensor] = None
+        if self.train_fdn:
+            # FDN path: early reflections + FDN late reverberation, both in
+            # time domain already — do NOT apply phase_recon (it randomises
+            # signs and blocks FDN gradients).
+            L = min(late.size(1), early.size(1))
+            rir_out = early[:, :L] + late[:, :L]
+        else:
+            # Fallback: per-band phase reconstruction from EDC
+            edc_mb_clamped = edc_pred.clamp(min=0.0)
+            phase = self.mb_phase_recon(edc_mb_clamped)  # [B, T-1]
+            L = min(late.size(1), early.size(1), phase.size(1))
+            rir_out = (early[:, :L] + late[:, :L]) * phase[:, :L]
         # Optional U-Net post-processing
         if self.unet is not None:
-            rir = self.unet(rir.unsqueeze(1)).squeeze(1)
-        out = {"rir": rir, "edc_pred": edc_pred, "fdn_params": params}
-        if return_intermediates:
-            out.update({"phase": phase})
+            rir_out = self.unet(rir_out.unsqueeze(1)).squeeze(1)
+        # Peak normalisation
+        rir_out = rir_out / (torch.amax(rir_out.abs(), dim=-1, keepdim=True) + 1e-8)
+        out: Dict[str, torch.Tensor] = {"rir": rir_out, "edc_pred": edc_pred, "fdn_params": params}
+        if return_intermediates and phase is not None:
+            out["phase"] = phase
         return out
