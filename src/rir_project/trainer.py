@@ -554,7 +554,7 @@ class RIRTrainer:
             "lambda_mom": float(self.criterion.lambda_mom),
         }
 
-    def validate(self) -> Dict[str, float]:
+    def validate(self, epoch: Optional[int] = None) -> Dict[str, float]:
         self.lstm.eval()
         if self.fdn is not None:
             self.fdn.eval()
@@ -562,6 +562,7 @@ class RIRTrainer:
             self.early.eval()
         if self.unet_refiner is not None:
             self.unet_refiner.eval()
+        epoch_for_mask = self.cfg.epochs if epoch is None else epoch
         total_loss = 0.0
         total_time_loss = 0.0
         total_mrstft_loss = 0.0
@@ -576,7 +577,7 @@ class RIRTrainer:
                 rir_pred = self._predict_rir_from_edc(edc_pred, apply_unet=True)
                 rir_target = y["rir"].to(self.device)
                 if self.cfg.use_composite_loss:
-                    comps = self._loss_components(epoch=self.cfg.epochs, x=x, rir_pred=rir_pred, rir_target=rir_target)
+                    comps = self._loss_components(epoch=epoch_for_mask, x=x, rir_pred=rir_pred, rir_target=rir_target)
                     loss = (
                         self.cfg.loss_weight_time * comps["time"]
                         + self.cfg.loss_weight_mrstft * comps["mrstft"]
@@ -667,7 +668,7 @@ class RIRTrainer:
         for epoch in range(self.cfg.epochs):
             t0 = time.perf_counter()
             train_metrics = self.train_one_epoch(epoch)
-            val_metrics = self.validate()
+            val_metrics = self.validate(epoch=epoch)
             elapsed = time.perf_counter() - t0
 
             score = float("inf")
