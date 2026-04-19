@@ -96,6 +96,7 @@ class TrainingConfig:
     loss_weight_time: float = 0.15
     loss_weight_mrstft: float = 0.55
     loss_weight_edc: float = 0.25
+    loss_weight_edc_min_scale: float = 0.35
     loss_weight_direct: float = 0.05
     stage_a_ratio: float = 0.35
     stage_a_window_ms: float = 100.0
@@ -107,6 +108,8 @@ class TrainingConfig:
     late_tail_penalty_weight: float = 0.02
     checkpoint_dir: str = "checkpoints"
     top_k_checkpoints: int = 3
+    fdn_scheduler_gamma: float = 0.90
+    fdn_scheduler_step_size: int = 5
 
     # collocation PINN
     use_collocation: bool = False
@@ -177,6 +180,7 @@ class RIRTrainer:
         self.mb_phase_recon = MultibandSignStickyPhaseReconstructor()
 
         params = list(self.lstm.parameters())
+        self._fdn_optim_params: List[torch.nn.Parameter] = []
         self.fdn = None
         self.early = None
         if c.train_fdn:
@@ -187,9 +191,11 @@ class RIRTrainer:
                 output_length=c.fdn_output_length,
             ).to(self.device)
             params.extend(list(self.fdn.parameters()))
+            self._fdn_optim_params.extend(list(self.fdn.parameters()))
             if c.early_late_split:
                 self.early = EarlyReflectionNet().to(self.device)
                 params.extend(list(self.early.parameters()))
+                self._fdn_optim_params.extend(list(self.early.parameters()))
 
         self.unet_refiner = None
         if c.use_unet:
@@ -223,6 +229,26 @@ class RIRTrainer:
             T_mult=1,
             eta_min=c.lr * 1e-3,
         )
+        self.fdn_scheduler = None
+        if c.train_fdn and self._fdn_optim_params:
+            fdn_ids = {id(p) for p in self._fdn_optim_params}
+            base_lrs = [pg["lr"] for pg in self.optimiser.param_groups]
+
+            def _fdn_lambda_builder(group_idx: int):
+                group_params = self.optimiser.param_groups[group_idx]["params"]
+                has_fdn = any(id(p) in fdn_ids for p in group_params)
+                if not has_fdn:
+                    return lambda _: 1.0
+                gamma = float(c.fdn_scheduler_gamma)
+                step_size = max(1, int(c.fdn_scheduler_step_size))
+                return lambda ep: gamma ** (ep // step_size)
+
+            self.fdn_scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimiser,
+                lr_lambda=[_fdn_lambda_builder(i) for i in range(len(self.optimiser.param_groups))],
+            )
+            for lr, pg in zip(base_lrs, self.optimiser.param_groups):
+                pg["lr"] = lr
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
         windows = [int(w) for w in c.mr_stft_windows.split(",")]
@@ -257,6 +283,7 @@ class RIRTrainer:
         self.collocation_loss = None
         self._optim_params = list(self.lstm.parameters())
         self.optimiser = optim.Adam(self._optim_params, lr=c.lr, weight_decay=c.weight_decay)
+        self.fdn_scheduler = None
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
     @staticmethod
@@ -403,6 +430,20 @@ class RIRTrainer:
             return max(1, min(max_len, short_len))
         return max_len
 
+    def _window_expansion_epoch(self) -> int:
+        return max(1, int(np.ceil(self.cfg.epochs * self.cfg.stage_a_ratio)))
+
+    def _should_reset_optimizer_state(self, epoch: int) -> bool:
+        return epoch == self._window_expansion_epoch()
+
+    def _edc_weight_for_epoch(self, epoch: int) -> float:
+        if self.cfg.epochs <= 1:
+            return float(self.cfg.loss_weight_edc)
+        progress = float(epoch) / float(max(1, self.cfg.epochs - 1))
+        min_scale = float(np.clip(self.cfg.loss_weight_edc_min_scale, 0.0, 1.0))
+        scale = 1.0 - (1.0 - min_scale) * progress
+        return float(self.cfg.loss_weight_edc * scale)
+
     def _direct_arrival_samples(self, x: torch.Tensor, rir_target: torch.Tensor) -> torch.Tensor:
         B, T = rir_target.shape
         search_len = max(1, min(T, int(self.cfg.sample_rate * (self.cfg.direct_search_ms / 1000.0))))
@@ -495,10 +536,11 @@ class RIRTrainer:
                 rir_target = y["rir"].to(self.device)
                 if self.cfg.use_composite_loss:
                     comps = self._loss_components(epoch, x, rir_pred, rir_target)
+                    edc_weight = self._edc_weight_for_epoch(epoch)
                     loss = (
                         self.cfg.loss_weight_time * comps["time"]
                         + self.cfg.loss_weight_mrstft * comps["mrstft"]
-                        + self.cfg.loss_weight_edc * comps["edc"]
+                        + edc_weight * comps["edc"]
                         + self.cfg.loss_weight_direct * comps["direct"]
                         + self.cfg.late_tail_penalty_weight * comps["tail_penalty"]
                     )
@@ -526,8 +568,16 @@ class RIRTrainer:
             self.scaler.scale(loss).backward()
 
             grad_norm = 0.0
-            if self.cfg.train_fdn and self.fdn is not None and self.fdn.log_kappa.grad is not None:
-                grad_norm = float(self.fdn.log_kappa.grad.detach().norm().item())
+            if self.cfg.train_fdn and self.fdn is not None:
+                fdn_grad_sq = 0.0
+                has_grad = False
+                for p in self.fdn.parameters():
+                    if p.grad is not None:
+                        g = float(p.grad.detach().norm().item())
+                        fdn_grad_sq += g * g
+                        has_grad = True
+                if has_grad:
+                    grad_norm = float(fdn_grad_sq ** 0.5)
 
             torch.nn.utils.clip_grad_norm_(self._optim_params, self.cfg.grad_clip)
             self.scaler.step(self.optimiser)
@@ -578,10 +628,11 @@ class RIRTrainer:
                 rir_target = y["rir"].to(self.device)
                 if self.cfg.use_composite_loss:
                     comps = self._loss_components(epoch=epoch_for_mask, x=x, rir_pred=rir_pred, rir_target=rir_target)
+                    edc_weight = self._edc_weight_for_epoch(epoch_for_mask)
                     loss = (
                         self.cfg.loss_weight_time * comps["time"]
                         + self.cfg.loss_weight_mrstft * comps["mrstft"]
-                        + self.cfg.loss_weight_edc * comps["edc"]
+                        + edc_weight * comps["edc"]
                         + self.cfg.loss_weight_direct * comps["direct"]
                         + self.cfg.late_tail_penalty_weight * comps["tail_penalty"]
                     )
@@ -666,6 +717,9 @@ class RIRTrainer:
         ckpt_dir = Path(self.cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         for epoch in range(self.cfg.epochs):
+            if self._should_reset_optimizer_state(epoch):
+                self.optimiser.state.clear()
+                print(f"[optim-reset] Cleared Adam state at epoch {epoch + 1} (temporal window expansion).")
             t0 = time.perf_counter()
             train_metrics = self.train_one_epoch(epoch)
             val_metrics = self.validate(epoch=epoch)
@@ -701,6 +755,8 @@ class RIRTrainer:
             history["log_kappa_grad_norm"].append(train_metrics.get("log_kappa_grad_norm", 0.0))
 
             self.scheduler.step()
+            if self.fdn_scheduler is not None:
+                self.fdn_scheduler.step()
             print(
                 f"Epoch {epoch+1}/{self.cfg.epochs} "
                 f"train={train_metrics['total']:.4f} "
@@ -739,7 +795,7 @@ class RIRTrainer:
             grads = [g for g in history["log_kappa_grad_norm"] if not np.isnan(g)]
             if grads and max(grads) < self.cfg.fdn_plateau_grad_threshold:
                 print(
-                    "[fdn-check] log_kappa gradients appear plateaued "
+                    "[fdn-check] FDN gradients appear plateaued "
                     f"(max={max(grads):.3e}, threshold={self.cfg.fdn_plateau_grad_threshold:.3e})."
                 )
                 if self.cfg.auto_adjust_max_delay_ms:
