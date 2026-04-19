@@ -30,6 +30,8 @@ from .models import (
 from .synthesis import MultibandSignStickyPhaseReconstructor, SignStickyPhaseReconstructor
 from .utils import edc_rmse_db, estimate_rt60, log_spectral_distance, set_seed
 
+SPEED_OF_SOUND_M_S = 343.0
+
 
 @dataclass
 class TrainingConfig:
@@ -419,7 +421,7 @@ class RIRTrainer:
             & (mic <= room).all(dim=1)
         )
         dist = torch.norm(src - mic, dim=1)
-        geom = torch.clamp((dist / 343.0 * self.cfg.sample_rate).long(), 0, max(0, T - 1))
+        geom = torch.clamp((dist / SPEED_OF_SOUND_M_S * self.cfg.sample_rate).long(), 0, max(0, T - 1))
         return torch.where(valid_geom, geom, fallback)
 
     def _direct_loss(self, rir_pred: torch.Tensor, rir_target: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -659,7 +661,7 @@ class RIRTrainer:
             "edc_rmse": [],
             "log_kappa_grad_norm": [],
         }
-        top_ckpts: List[Dict[str, float | str]] = []
+        top_ckpts: List[Dict[str, object]] = []
         ckpt_dir = Path(self.cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         for epoch in range(self.cfg.epochs):

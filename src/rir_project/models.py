@@ -16,6 +16,8 @@ import torch.nn.functional as F
 
 from .data import INPUT_DIM, OCTAVE_BANDS
 
+FDN_GAIN_MAX = 0.999
+
 
 def _hadamard_matrix(n: int) -> torch.Tensor:
     """Construct a Hadamard matrix for power-of-two n."""
@@ -215,8 +217,9 @@ class DifferentiableFDN(nn.Module):
         # Map unbounded params to stable physical ranges.
         max_delay_samples = max(1.0, self.max_delay_ms * self.sample_rate / 1000.0)
         kappa = 1.0 + torch.sigmoid(self.log_kappa) * (max_delay_samples - 1.0)
-        alpha = 0.999 * torch.sigmoid(self.alpha_raw)
-        beta = 0.999 * torch.sigmoid(self.beta_raw)
+        # Keep feedback gains strictly below 1 for stable recursion.
+        alpha = FDN_GAIN_MAX * torch.sigmoid(self.alpha_raw)
+        beta = FDN_GAIN_MAX * torch.sigmoid(self.beta_raw)
 
         # Each delay line is an exponential smoother whose decay is controlled by kappa.
         decays = torch.exp(-1.0 / kappa).clamp(0.0, 0.9999)
