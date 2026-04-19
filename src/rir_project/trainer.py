@@ -5,7 +5,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -13,7 +13,13 @@ import torch.nn.functional as F
 from torch import optim
 
 from .data import DEVICE, INPUT_DIM, get_dataloader
-from .loss import CollocationPhysicsLoss, MultiResolutionSTFTLoss, PhysicsInformedRIRLoss
+from .loss import (
+    CollocationPhysicsLoss,
+    EDCDBLoss,
+    MultiResolutionSTFTLoss,
+    PhysicsInformedRIRLoss,
+    late_tail_energy_growth_penalty,
+)
 from .models import (
     DifferentiableFDN,
     EarlyReflectionNet,
@@ -84,6 +90,21 @@ class TrainingConfig:
     use_mr_stft: bool = False
     mr_stft_weight: float = 1.0
     mr_stft_windows: str = "512,1024,2048"
+    use_composite_loss: bool = True
+    loss_weight_time: float = 0.15
+    loss_weight_mrstft: float = 0.55
+    loss_weight_edc: float = 0.25
+    loss_weight_direct: float = 0.05
+    stage_a_ratio: float = 0.35
+    stage_a_window_ms: float = 100.0
+    direct_window_ms: float = 3.0
+    direct_search_ms: float = 8.0
+    use_smooth_l1_direct: bool = True
+    use_late_tail_penalty: bool = False
+    late_tail_start_ms: float = 50.0
+    late_tail_penalty_weight: float = 0.02
+    checkpoint_dir: str = "checkpoints"
+    top_k_checkpoints: int = 3
 
     # collocation PINN
     use_collocation: bool = False
@@ -188,7 +209,8 @@ class RIRTrainer:
                 lambda_mom=c.collocation_lambda_mom,
             ).to(self.device)
 
-        self.optimiser = optim.Adam(params, lr=c.lr, weight_decay=c.weight_decay)
+        self._optim_params = params
+        self.optimiser = optim.Adam(self._optim_params, lr=c.lr, weight_decay=c.weight_decay)
         # CosineAnnealingWarmRestarts provides better convergence than ReduceLROnPlateau
         # for EDC regression; restarts help escape local minima during curriculum phases.
         # T_0 = max(10, epochs//5): restart every ~20% of total training, but at least
@@ -201,10 +223,9 @@ class RIRTrainer:
         )
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
-        self.mr_stft_loss = None
-        if c.use_mr_stft:
-            windows = [int(w) for w in c.mr_stft_windows.split(",")]
-            self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows).to(self.device)
+        windows = [int(w) for w in c.mr_stft_windows.split(",")]
+        self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows).to(self.device)
+        self.edc_db_loss = EDCDBLoss(use_smooth_l1=False).to(self.device)
 
         self._components_ready = True
 
@@ -228,9 +249,12 @@ class RIRTrainer:
         self.fdn = None
         self.early = None
         self.unet_refiner = None
-        self.mr_stft_loss = None
+        windows = [int(w) for w in c.mr_stft_windows.split(",")]
+        self.mr_stft_loss = MultiResolutionSTFTLoss(window_lengths=windows).to(self.device)
+        self.edc_db_loss = EDCDBLoss(use_smooth_l1=False).to(self.device)
         self.collocation_loss = None
-        self.optimiser = optim.Adam(self.lstm.parameters(), lr=c.lr, weight_decay=c.weight_decay)
+        self._optim_params = list(self.lstm.parameters())
+        self.optimiser = optim.Adam(self._optim_params, lr=c.lr, weight_decay=c.weight_decay)
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=c.use_amp and self.device.type == "cuda")
 
     @staticmethod
@@ -288,11 +312,19 @@ class RIRTrainer:
         return {
             "train_loss": [loss_value],
             "val_loss": [loss_value],
+            "train_time_loss": [loss_value],
+            "train_mrstft_loss": [0.0],
+            "train_edc_loss": [0.0],
+            "train_direct_loss": [0.0],
+            "val_time_loss": [loss_value],
+            "val_mrstft_loss": [0.0],
+            "val_edc_loss": [0.0],
+            "val_direct_loss": [0.0],
+            "val_composite_score": [float("inf")],
             "epoch_time_sec": [0.0],
             "rt60_error": [float("nan")],
             "lsd": [float("nan")],
             "edc_rmse": [float("nan")],
-            "fdn_loss": [0.0],
             "log_kappa_grad_norm": [0.0],
         }
 
@@ -362,6 +394,80 @@ class RIRTrainer:
             return c.fdn_curriculum_length
         return c.fdn_output_length
 
+    def _loss_window_samples(self, epoch: int, max_len: int) -> int:
+        stage_a_epochs = max(1, int(np.ceil(self.cfg.epochs * self.cfg.stage_a_ratio)))
+        if epoch < stage_a_epochs:
+            short_len = int(self.cfg.sample_rate * (self.cfg.stage_a_window_ms / 1000.0))
+            return max(1, min(max_len, short_len))
+        return max_len
+
+    def _direct_arrival_samples(self, x: torch.Tensor, rir_target: torch.Tensor) -> torch.Tensor:
+        B, T = rir_target.shape
+        search_len = max(1, min(T, int(self.cfg.sample_rate * (self.cfg.direct_search_ms / 1000.0))))
+        fallback = torch.argmax(rir_target[:, :search_len].abs(), dim=1)
+
+        if x.shape[1] < 9:
+            return fallback
+        room = x[:, :3]
+        src = x[:, 3:6]
+        mic = x[:, 6:9]
+        valid_geom = (
+            (room > 0.0).all(dim=1)
+            & (src >= 0.0).all(dim=1)
+            & (mic >= 0.0).all(dim=1)
+            & (src <= room).all(dim=1)
+            & (mic <= room).all(dim=1)
+        )
+        dist = torch.norm(src - mic, dim=1)
+        geom = torch.clamp((dist / 343.0 * self.cfg.sample_rate).long(), 0, max(0, T - 1))
+        return torch.where(valid_geom, geom, fallback)
+
+    def _direct_loss(self, rir_pred: torch.Tensor, rir_target: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        centers = self._direct_arrival_samples(x, rir_target)
+        half_window = max(1, int(self.cfg.sample_rate * (self.cfg.direct_window_ms / 1000.0)))
+        losses: List[torch.Tensor] = []
+        for i in range(rir_pred.size(0)):
+            c = int(centers[i].item())
+            s = max(0, c - half_window)
+            e = min(rir_pred.size(1), c + half_window + 1)
+            p = rir_pred[i, s:e]
+            t = rir_target[i, s:e]
+            if self.cfg.use_smooth_l1_direct:
+                losses.append(F.smooth_l1_loss(p, t))
+            else:
+                losses.append(F.l1_loss(p, t))
+        if not losses:
+            return torch.zeros((), device=rir_pred.device, dtype=rir_pred.dtype)
+        return torch.stack(losses).mean()
+
+    def _loss_components(
+        self,
+        epoch: int,
+        x: torch.Tensor,
+        rir_pred: torch.Tensor,
+        rir_target: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        L = min(rir_pred.shape[1], rir_target.shape[1])
+        L = self._loss_window_samples(epoch, L)
+        rp = rir_pred[:, :L]
+        rt = rir_target[:, :L]
+        time_loss = F.mse_loss(rp, rt)
+        mrstft_loss = self.mr_stft_loss(rp.float(), rt.float()) if self.mr_stft_loss is not None else torch.zeros((), device=self.device)
+        edc_loss = self.edc_db_loss(rp, rt) if self.edc_db_loss is not None else torch.zeros((), device=self.device)
+        direct_loss = self._direct_loss(rp, rt, x)
+        tail_penalty = torch.zeros((), device=self.device)
+        if self.cfg.use_late_tail_penalty:
+            tail_penalty = late_tail_energy_growth_penalty(
+                rp, sample_rate=self.cfg.sample_rate, start_ms=self.cfg.late_tail_start_ms
+            )
+        return {
+            "time": time_loss,
+            "mrstft": mrstft_loss,
+            "edc": edc_loss,
+            "direct": direct_loss,
+            "tail_penalty": tail_penalty,
+        }
+
     def train_one_epoch(self, epoch: int) -> Dict[str, float]:
         self.lstm.train()
         if self.fdn is not None:
@@ -372,31 +478,44 @@ class RIRTrainer:
             self.unet_refiner.train()
         self._apply_curriculum(epoch)
         total_loss = 0.0
-        total_fdn_loss = 0.0
+        total_time_loss = 0.0
+        total_mrstft_loss = 0.0
+        total_edc_loss = 0.0
+        total_direct_loss = 0.0
         total_grad_norm = 0.0
         n_steps = 0
         for step, (x, y) in enumerate(self.train_loader):
             x = x.to(self.device)
-            edc_target = y["edc_mb"].to(self.device)
             self.optimiser.zero_grad(set_to_none=True)
             with torch.amp.autocast(self.device.type, enabled=self.scaler.is_enabled()):
                 edc_pred = self.lstm(x)
-                loss = self.criterion(edc_pred, edc_target)
-                fdn_loss = torch.zeros((), device=self.device)
-                if self.cfg.train_fdn and self.fdn is not None:
-                    # predict with optional U-Net applied
-                    rir_pred = self._predict_rir_from_edc(edc_pred, apply_unet=True)
-                    rir_target = y["rir"].to(self.device)
+                rir_pred = self._predict_rir_from_edc(edc_pred, apply_unet=True)
+                rir_target = y["rir"].to(self.device)
+                if self.cfg.use_composite_loss:
+                    comps = self._loss_components(epoch, x, rir_pred, rir_target)
+                    loss = (
+                        self.cfg.loss_weight_time * comps["time"]
+                        + self.cfg.loss_weight_mrstft * comps["mrstft"]
+                        + self.cfg.loss_weight_edc * comps["edc"]
+                        + self.cfg.loss_weight_direct * comps["direct"]
+                        + self.cfg.late_tail_penalty_weight * comps["tail_penalty"]
+                    )
+                else:
+                    edc_target = y["edc_mb"].to(self.device)
+                    loss = self.criterion(edc_pred, edc_target)
                     L = min(rir_pred.shape[1], rir_target.shape[1])
-                    fdn_loss = F.mse_loss(rir_pred[:, :L], rir_target[:, :L])
-                    # unet_weight lets the user scale the contribution of the
-                    # time-domain loss when a refiner is present
+                    comps = {
+                        "time": F.mse_loss(rir_pred[:, :L], rir_target[:, :L]),
+                        "mrstft": torch.zeros((), device=self.device),
+                        "edc": torch.zeros((), device=self.device),
+                        "direct": torch.zeros((), device=self.device),
+                    }
                     weight = self.cfg.unet_weight if self.unet_refiner is not None else 1.0
-                    loss = loss + self.cfg.fdn_weight * weight * fdn_loss
-                    # MR-STFT loss applied to time-domain RIR when FDN is active
-                    if self.mr_stft_loss is not None:
-                        mr_loss = self.mr_stft_loss(rir_pred[:, :L].float(), rir_target[:, :L].float())
-                        loss = loss + self.cfg.mr_stft_weight * mr_loss
+                    loss = loss + self.cfg.fdn_weight * weight * comps["time"]
+                    if self.cfg.use_mr_stft and self.mr_stft_loss is not None:
+                        loss = loss + self.cfg.mr_stft_weight * self.mr_stft_loss(
+                            rir_pred[:, :L].float(), rir_target[:, :L].float()
+                        )
                 # Collocation-based PINN physics loss
                 if self.collocation_loss is not None:
                     room_dims = x[:, :3].clamp(min=0.1)
@@ -408,12 +527,15 @@ class RIRTrainer:
             if self.cfg.train_fdn and self.fdn is not None and self.fdn.log_kappa.grad is not None:
                 grad_norm = float(self.fdn.log_kappa.grad.detach().norm().item())
 
-            torch.nn.utils.clip_grad_norm_(self.lstm.parameters(), self.cfg.grad_clip)
+            torch.nn.utils.clip_grad_norm_(self._optim_params, self.cfg.grad_clip)
             self.scaler.step(self.optimiser)
             self.scaler.update()
 
             total_loss += loss.item()
-            total_fdn_loss += float(fdn_loss.item())
+            total_time_loss += float(comps["time"].item())
+            total_mrstft_loss += float(comps["mrstft"].item())
+            total_edc_loss += float(comps["edc"].item())
+            total_direct_loss += float(comps["direct"].item())
             total_grad_norm += grad_norm
             n_steps += 1
 
@@ -421,7 +543,10 @@ class RIRTrainer:
         avg = total_loss / denom
         return {
             "total": avg,
-            "fdn": total_fdn_loss / denom,
+            "time": total_time_loss / denom,
+            "mrstft": total_mrstft_loss / denom,
+            "edc": total_edc_loss / denom,
+            "direct": total_direct_loss / denom,
             "log_kappa_grad_norm": total_grad_norm / denom,
             "lambda_cont": float(self.criterion.lambda_cont),
             "lambda_mom": float(self.criterion.lambda_mom),
@@ -436,24 +561,39 @@ class RIRTrainer:
         if self.unet_refiner is not None:
             self.unet_refiner.eval()
         total_loss = 0.0
-        total_fdn_loss = 0.0
+        total_time_loss = 0.0
+        total_mrstft_loss = 0.0
+        total_edc_loss = 0.0
+        total_direct_loss = 0.0
         metric_count = 0
         rt60_vals, lsd_vals, edc_vals = [], [], []
         with torch.no_grad():
             for batch_idx, (x, y) in enumerate(self.val_loader):
                 x = x.to(self.device)
-                edc_target = y["edc_mb"].to(self.device)
                 edc_pred = self.lstm(x)
-                loss = self.criterion(edc_pred, edc_target)
-                fdn_loss = torch.zeros((), device=self.device)
-                # validation predictions also go through the refiner if active
                 rir_pred = self._predict_rir_from_edc(edc_pred, apply_unet=True)
-                if self.cfg.train_fdn and self.fdn is not None:
-                    rir_target = y["rir"].to(self.device)
+                rir_target = y["rir"].to(self.device)
+                if self.cfg.use_composite_loss:
+                    comps = self._loss_components(epoch=self.cfg.epochs, x=x, rir_pred=rir_pred, rir_target=rir_target)
+                    loss = (
+                        self.cfg.loss_weight_time * comps["time"]
+                        + self.cfg.loss_weight_mrstft * comps["mrstft"]
+                        + self.cfg.loss_weight_edc * comps["edc"]
+                        + self.cfg.loss_weight_direct * comps["direct"]
+                        + self.cfg.late_tail_penalty_weight * comps["tail_penalty"]
+                    )
+                else:
+                    edc_target = y["edc_mb"].to(self.device)
+                    loss = self.criterion(edc_pred, edc_target)
                     L = min(rir_pred.shape[1], rir_target.shape[1])
-                    fdn_loss = F.mse_loss(rir_pred[:, :L], rir_target[:, :L])
+                    comps = {
+                        "time": F.mse_loss(rir_pred[:, :L], rir_target[:, :L]),
+                        "mrstft": torch.zeros((), device=self.device),
+                        "edc": torch.zeros((), device=self.device),
+                        "direct": torch.zeros((), device=self.device),
+                    }
                     weight = self.cfg.unet_weight if self.unet_refiner is not None else 1.0
-                    loss = loss + self.cfg.fdn_weight * weight * fdn_loss
+                    loss = loss + self.cfg.fdn_weight * weight * comps["time"]
 
                 if batch_idx < max(1, self.cfg.metrics_eval_batches):
                     rir_ref = y["rir"].cpu().numpy()
@@ -469,13 +609,19 @@ class RIRTrainer:
                         metric_count += 1
 
                 total_loss += loss.item()
-                total_fdn_loss += float(fdn_loss.item())
+                total_time_loss += float(comps["time"].item())
+                total_mrstft_loss += float(comps["mrstft"].item())
+                total_edc_loss += float(comps["edc"].item())
+                total_direct_loss += float(comps["direct"].item())
 
         denom = max(1, len(self.val_loader))
         avg = total_loss / denom
         return {
             "total": avg,
-            "fdn": total_fdn_loss / denom,
+            "time": total_time_loss / denom,
+            "mrstft": total_mrstft_loss / denom,
+            "edc": total_edc_loss / denom,
+            "direct": total_direct_loss / denom,
             "rt60_error": float(np.nanmean(rt60_vals)) if rt60_vals else float("nan"),
             "lsd": float(np.nanmean(lsd_vals)) if lsd_vals else float("nan"),
             "edc_rmse": float(np.nanmean(edc_vals)) if edc_vals else float("nan"),
@@ -498,36 +644,93 @@ class RIRTrainer:
         history = {
             "train_loss": [],
             "val_loss": [],
+            "train_time_loss": [],
+            "train_mrstft_loss": [],
+            "train_edc_loss": [],
+            "train_direct_loss": [],
+            "val_time_loss": [],
+            "val_mrstft_loss": [],
+            "val_edc_loss": [],
+            "val_direct_loss": [],
+            "val_composite_score": [],
             "epoch_time_sec": [],
             "rt60_error": [],
             "lsd": [],
             "edc_rmse": [],
-            "fdn_loss": [],
             "log_kappa_grad_norm": [],
         }
+        top_ckpts: List[Dict[str, float | str]] = []
+        ckpt_dir = Path(self.cfg.checkpoint_dir)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
         for epoch in range(self.cfg.epochs):
             t0 = time.perf_counter()
             train_metrics = self.train_one_epoch(epoch)
             val_metrics = self.validate()
             elapsed = time.perf_counter() - t0
 
+            score = float("inf")
+            if (
+                np.isfinite(val_metrics["lsd"])
+                and np.isfinite(val_metrics["edc_rmse"])
+                and np.isfinite(val_metrics["rt60_error"])
+            ):
+                score = (
+                    0.5 * float(val_metrics["lsd"])
+                    + 0.3 * float(val_metrics["edc_rmse"])
+                    + 0.2 * float(val_metrics["rt60_error"])
+                )
+
             history["train_loss"].append(train_metrics["total"])
             history["val_loss"].append(val_metrics["total"])
+            history["train_time_loss"].append(train_metrics["time"])
+            history["train_mrstft_loss"].append(train_metrics["mrstft"])
+            history["train_edc_loss"].append(train_metrics["edc"])
+            history["train_direct_loss"].append(train_metrics["direct"])
+            history["val_time_loss"].append(val_metrics["time"])
+            history["val_mrstft_loss"].append(val_metrics["mrstft"])
+            history["val_edc_loss"].append(val_metrics["edc"])
+            history["val_direct_loss"].append(val_metrics["direct"])
+            history["val_composite_score"].append(score)
             history["epoch_time_sec"].append(elapsed)
             history["rt60_error"].append(val_metrics["rt60_error"])
             history["lsd"].append(val_metrics["lsd"])
             history["edc_rmse"].append(val_metrics["edc_rmse"])
-            history["fdn_loss"].append(val_metrics.get("fdn", 0.0))
             history["log_kappa_grad_norm"].append(train_metrics.get("log_kappa_grad_norm", 0.0))
 
             self.scheduler.step()
-            if (epoch + 1) % self.cfg.log_every == 0:
-                print(
-                    f"Epoch {epoch+1}/{self.cfg.epochs} "
-                    f"train={train_metrics['total']:.4f} val={val_metrics['total']:.4f} "
-                    f"rt60={val_metrics['rt60_error']:.4f}s lsd={val_metrics['lsd']:.4f}dB "
-                    f"edc={val_metrics['edc_rmse']:.4f}dB time={elapsed:.2f}s"
+            print(
+                f"Epoch {epoch+1}/{self.cfg.epochs} "
+                f"train={train_metrics['total']:.4f} "
+                f"(time={train_metrics['time']:.4f}, mrstft={train_metrics['mrstft']:.4f}, "
+                f"edc={train_metrics['edc']:.4f}, direct={train_metrics['direct']:.4f}) "
+                f"val={val_metrics['total']:.4f} "
+                f"(time={val_metrics['time']:.4f}, mrstft={val_metrics['mrstft']:.4f}, "
+                f"edc={val_metrics['edc']:.4f}, direct={val_metrics['direct']:.4f}) "
+                f"score={score:.4f} rt60={val_metrics['rt60_error']:.4f}s "
+                f"lsd={val_metrics['lsd']:.4f}dB edc_rmse={val_metrics['edc_rmse']:.4f}dB "
+                f"time={elapsed:.2f}s"
+            )
+
+            if np.isfinite(score):
+                ckpt_path = ckpt_dir / f"epoch_{epoch + 1:03d}_score_{score:.6f}.pt"
+                torch.save(
+                    {
+                        "epoch": epoch + 1,
+                        "score": score,
+                        "config": asdict(self.cfg),
+                        "lstm": self.lstm.state_dict(),
+                        "fdn": self.fdn.state_dict() if self.fdn is not None else None,
+                        "early": self.early.state_dict() if self.early is not None else None,
+                        "unet_refiner": self.unet_refiner.state_dict() if self.unet_refiner is not None else None,
+                    },
+                    ckpt_path,
                 )
+                top_ckpts.append({"score": score, "path": str(ckpt_path)})
+                top_ckpts = sorted(top_ckpts, key=lambda x: float(x["score"]))[: max(1, self.cfg.top_k_checkpoints)]
+                keep = {entry["path"] for entry in top_ckpts}
+                for p in ckpt_dir.glob("epoch_*_score_*.pt"):
+                    if str(p) not in keep:
+                        p.unlink(missing_ok=True)
 
         if self.cfg.train_fdn and self.fdn is not None:
             grads = [g for g in history["log_kappa_grad_norm"] if not np.isnan(g)]
@@ -552,7 +755,11 @@ class RIRTrainer:
                     "lsd": history["lsd"][-1] if history["lsd"] else float("nan"),
                     "edc_rmse": history["edc_rmse"][-1] if history["edc_rmse"] else float("nan"),
                     "epoch_time_sec_mean": float(np.nanmean(history["epoch_time_sec"])) if history["epoch_time_sec"] else float("nan"),
-                    "fdn_loss": history["fdn_loss"][-1] if history["fdn_loss"] else 0.0,
+                    "time_loss": history["val_time_loss"][-1] if history["val_time_loss"] else float("nan"),
+                    "mrstft_loss": history["val_mrstft_loss"][-1] if history["val_mrstft_loss"] else float("nan"),
+                    "edc_loss": history["val_edc_loss"][-1] if history["val_edc_loss"] else float("nan"),
+                    "direct_loss": history["val_direct_loss"][-1] if history["val_direct_loss"] else float("nan"),
+                    "val_composite_score": history["val_composite_score"][-1] if history["val_composite_score"] else float("inf"),
                     "log_kappa_grad_norm": history["log_kappa_grad_norm"][-1] if history["log_kappa_grad_norm"] else 0.0,
                 },
                 "history": history,
@@ -560,4 +767,7 @@ class RIRTrainer:
             with open(self.cfg.save_metrics_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
             print(f"[metrics] Saved run metrics to {self.cfg.save_metrics_path}")
+        if top_ckpts:
+            best = top_ckpts[0]
+            print(f"[checkpoint] best={best['path']} score={float(best['score']):.6f}")
         return history
