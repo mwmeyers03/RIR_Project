@@ -338,9 +338,8 @@ def _stft_mag_phase(
 class MultiResolutionSTFTLoss(nn.Module):
     """Multi-Resolution STFT loss over several window lengths.
 
-    Computes spectral magnitude (L1) and rectangular-coordinate phase loss
-    over the given window sizes.  Phase angles are mapped to (cos, sin) on
-    the unit circle to avoid phase-wraparound artefacts.
+    Computes spectral convergence and log-magnitude loss over the given
+    window sizes using ``torch.stft`` (no torchaudio dependency required).
     """
 
     def __init__(self, window_lengths: List[int] | None = None) -> None:
@@ -353,17 +352,63 @@ class MultiResolutionSTFTLoss(nn.Module):
         for wl in self.window_lengths:
             fft_size = wl
             hop = wl // 4
-            mag_p, cos_p, sin_p = _stft_mag_phase(pred, fft_size, hop, wl)
-            mag_t, cos_t, sin_t = _stft_mag_phase(target, fft_size, hop, wl)
-            # Spectral convergence (magnitude L1)
-            loss = loss + F.l1_loss(mag_p, mag_t)
+            mag_p, _, _ = _stft_mag_phase(pred, fft_size, hop, wl)
+            mag_t, _, _ = _stft_mag_phase(target, fft_size, hop, wl)
+            # Spectral convergence
+            sc_num = torch.norm(mag_t - mag_p, p="fro")
+            sc_den = torch.norm(mag_t, p="fro") + 1e-8
+            sc_loss = sc_num / sc_den
             # Log-magnitude MSE
-            loss = loss + F.mse_loss(
+            logmag_loss = F.mse_loss(
                 torch.log(mag_p + 1e-7), torch.log(mag_t + 1e-7)
             )
-            # Rectangular phase loss (avoids wraparound)
-            loss = loss + F.mse_loss(cos_p, cos_t) + F.mse_loss(sin_p, sin_t)
+            loss = loss + sc_loss + logmag_loss
         return loss / len(self.window_lengths)
+
+
+def schroeder_edc_db(rir: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Compute Schroeder-integrated EDC in dB from a time-domain RIR.
+
+    Parameters
+    ----------
+    rir : Tensor[B, T]
+        Time-domain RIR.
+    eps : float
+        Numerical stability epsilon.
+    """
+    energy = rir.pow(2)
+    rev_cum = torch.flip(torch.cumsum(torch.flip(energy, dims=[1]), dim=1), dims=[1])
+    norm = rev_cum / (rev_cum[:, :1] + eps)
+    return 10.0 * torch.log10(norm + eps)
+
+
+class EDCDBLoss(nn.Module):
+    """L1 loss between predicted and reference Schroeder EDC in dB."""
+
+    def __init__(self, use_smooth_l1: bool = False) -> None:
+        super().__init__()
+        self.use_smooth_l1 = use_smooth_l1
+
+    def forward(self, rir_pred: torch.Tensor, rir_target: torch.Tensor) -> torch.Tensor:
+        edc_pred_db = schroeder_edc_db(rir_pred)
+        edc_tgt_db = schroeder_edc_db(rir_target)
+        if self.use_smooth_l1:
+            return F.smooth_l1_loss(edc_pred_db, edc_tgt_db)
+        return F.l1_loss(edc_pred_db, edc_tgt_db)
+
+
+def late_tail_energy_growth_penalty(
+    rir: torch.Tensor,
+    sample_rate: int,
+    start_ms: float = 50.0,
+) -> torch.Tensor:
+    """Penalize non-physical increases in late-tail energy."""
+    start = int(sample_rate * (start_ms / 1000.0))
+    if rir.size(1) <= start + 1:
+        return torch.zeros((), device=rir.device, dtype=rir.dtype)
+    e = rir[:, start:].pow(2)
+    growth = F.relu(e[:, 1:] - e[:, :-1])
+    return growth.mean()
 
 
 class PhysicsInformedRIRLoss(nn.Module):

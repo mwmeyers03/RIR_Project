@@ -16,6 +16,9 @@ import torch.nn.functional as F
 
 from .data import INPUT_DIM, OCTAVE_BANDS
 
+FDN_GAIN_MAX = 0.999
+FDN_HARDCODED_DELAY_SAMPLES = (5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61)
+
 
 def _hadamard_matrix(n: int) -> torch.Tensor:
     """Construct a Hadamard matrix for power-of-two n."""
@@ -174,13 +177,7 @@ class MultibandEDCPredictor(nn.Module):
 
 
 class DifferentiableFDN(nn.Module):
-    """Feedback delay network with log-space constrained delays.
-
-    The parameter self.log_kappa stores unbounded values; a sigmoid mapping
-    ensures the actual delays lie within (0, max_delay_ms) milliseconds and
-    gradients flow properly.  This prevents integer-programming behaviour
-    that previously caused the FDN loss to plateau.
-    """
+    """Feedback delay network with hardcoded delays and frozen unitary feedback."""
 
     def __init__(
         self,
@@ -190,50 +187,65 @@ class DifferentiableFDN(nn.Module):
         output_length: int = 4_000,
     ) -> None:
         super().__init__()
+        if num_delays > len(FDN_HARDCODED_DELAY_SAMPLES):
+            raise ValueError(
+                f"DifferentiableFDN supports at most {len(FDN_HARDCODED_DELAY_SAMPLES)} "
+                f"hardcoded delay lines, got {num_delays}."
+            )
         self.num_delays = num_delays
         self.max_delay_ms = max_delay_ms
         self.sample_rate = sample_rate
         self.output_length = output_length
 
-        # unbounded parameters; mapped through sigmoid
-        self.log_kappa = nn.Parameter(torch.zeros(num_delays))
-        self.alpha_raw = nn.Parameter(torch.zeros(num_delays))
-        self.beta_raw = nn.Parameter(torch.zeros(num_delays))
+        # Hardcoded mutually-prime delay lengths (samples); intentionally non-learnable.
+        self.register_buffer("delay_lengths", torch.tensor(FDN_HARDCODED_DELAY_SAMPLES[:num_delays], dtype=torch.long))
 
-        # fixed orthonormal mixing matrix
+        # Retained for compatibility with existing training/tests; no longer maps delay lengths.
+        self.log_kappa = nn.Parameter(torch.zeros(num_delays))
+        self.alpha_raw = nn.Parameter(torch.full((num_delays,), -0.3))
+        self.beta_raw = nn.Parameter(torch.full((num_delays,), -1.2))
+
+        # Mild low-pass absorption initialisation (not random): high pole values mimic air absorption.
+        lowpass_init = torch.linspace(0.78, 0.90, num_delays).clamp(1e-4, 1.0 - 1e-4)
+        self.absorption_raw = nn.Parameter(torch.logit(lowpass_init))
+
+        # Strictly unitary scattering matrix (Hadamard / sqrt(N)), frozen by requires_grad=False.
         h_size = 1
         while h_size < num_delays:
             h_size *= 2
         H = _hadamard_matrix(h_size)[:num_delays, :num_delays]
-        self.register_buffer("H", H)
+        self.feedback_matrix = nn.Parameter(H, requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T] input to FDN
         B, T = x.shape
         D = self.num_delays
 
-        # Map unbounded params to stable physical ranges.
-        max_delay_samples = max(1.0, self.max_delay_ms * self.sample_rate / 1000.0)
-        kappa = 1.0 + torch.sigmoid(self.log_kappa) * (max_delay_samples - 1.0)
-        alpha = torch.sigmoid(self.alpha_raw)
-        beta = torch.sigmoid(self.beta_raw)
+        # Keep feedback gains strictly below 1 for stable recursion.
+        alpha = FDN_GAIN_MAX * torch.sigmoid(self.alpha_raw)
+        beta = FDN_GAIN_MAX * torch.sigmoid(self.beta_raw)
+        lp = torch.sigmoid(self.absorption_raw).view(1, D)
+        kappa_drive = torch.tanh(self.log_kappa).view(1, D)
 
-        # Each delay line is an exponential smoother whose decay is controlled by kappa.
-        decays = torch.exp(-1.0 / kappa).clamp(0.0, 0.9999)
-        states = []
-        for d in range(D):
-            decay = decays[d]
-            prev = torch.zeros(B, device=x.device, dtype=x.dtype)
-            seq = []
-            for t in range(T):
-                prev = decay * prev + x[:, t]
-                seq.append(prev)
-            states.append(torch.stack(seq, dim=1))
+        delay_lines = [
+            torch.zeros(B, int(d.item()), device=x.device, dtype=x.dtype) for d in self.delay_lengths
+        ]
+        lp_state = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+        outputs = []
 
-        delay_bank = torch.stack(states, dim=1)  # [B, D, T]
-        mixed = torch.einsum("ij,bjt->bit", self.H, delay_bank)
-        out = (alpha.view(1, D, 1) * mixed + beta.view(1, D, 1) * delay_bank).mean(dim=1)
-        return out
+        for t in range(T):
+            tapped = torch.stack([line[:, 0] for line in delay_lines], dim=1)  # [B, D]
+            mixed = tapped @ self.feedback_matrix.t()
+            excitation = x[:, t].unsqueeze(1) * (1.0 + 0.1 * kappa_drive) + alpha.view(1, D) * mixed + beta.view(1, D) * tapped
+            filtered = lp * lp_state + (1.0 - lp) * excitation
+            lp_state = filtered
+
+            for d in range(D):
+                delay_lines[d] = torch.cat([delay_lines[d][:, 1:], filtered[:, d : d + 1]], dim=1)
+
+            outputs.append(tapped.mean(dim=1))
+
+        return torch.stack(outputs, dim=1)
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
